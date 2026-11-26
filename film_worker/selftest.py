@@ -10,6 +10,10 @@ from .state import State
 
 
 def check(root):
+    import alibabacloud_oss_v2
+
+    if not alibabacloud_oss_v2.Client:
+        raise ValueError("运行环境缺少 OSS SDK")
     if root.exists() and not root.is_dir():
         raise ValueError("数据目录不可用")
     if any(not (Path(__file__).parent / "web" / asset).is_file()

@@ -87,11 +87,12 @@ class State:
                        (status, json.dumps(pending) if pending is not None else None,
                         json.dumps(receipt) if receipt is not None else None, message, work, number))
 
-    def rows(self, only_open=False, limit=-1):
+    def rows(self, only_open=False, limit=-1, *, states=()):
         with self.connection() as db:
-            sql = "SELECT * FROM attempts"
-            query = sql + (" WHERE status='active'" if only_open else "") + " ORDER BY updated DESC LIMIT ?"
-            return [dict(row) for row in db.execute(query, (limit,))]
+            states = ("active",) if only_open else states
+            condition = f" WHERE status IN ({','.join('?' for _ in states)})" if states else ""
+            query = "SELECT * FROM attempts" + condition + " ORDER BY updated DESC LIMIT ?"
+            return [dict(row) for row in db.execute(query, (*states, limit))]
 
     def event(self, assignment, status, *, level="info", message=None):
         work, number = identity(assignment)

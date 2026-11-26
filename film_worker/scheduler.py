@@ -13,12 +13,14 @@ import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import bundles
+from . import bundles, oss_delivery
 from .model_recovery import ResumeLease, location as recovery_location
 from .progress import Progress, panel_details
 from .processes import ProcessTree
 from .protocol import (LOCAL_REVIEW_MODE, REJECTED_FRAMES_MODE, REVIEW_STORAGE_HEADER, REVIEW_UPLOAD_HEADER,
-                       Client, Interrupted, ProtocolError, Transfer, digest, key, opaque, valid_digest)
+                       Client, Interrupted, ProtocolError, ReviewFrameLimitError, Transfer,
+                       check_review_frame_limit, digest, key, opaque, valid_digest)
+from .secrets import read_oss_keys
 from .settings import (KINDS, REVIEW_FIELDS, ROOT, atomic_json, environment, inspect_tools, object_hash,
                        production_settings, registration, resolve_tools, validate_config)
 from .state import State, identity, slot
@@ -43,7 +45,31 @@ def read(path):
 
 def output_roles(assignment):
     roles = OUTPUT_ROLES[assignment["kind"]]
+    if oss_delivery.uses_objects(assignment) and assignment["kind"] != "finalize":
+        return (roles - {"scene_bundle"}) | {"review_index"}
     return roles - {"scene_bundle"} if "review_storage" in assignment["input_manifest"] else roles
+
+
+def attempt_history(root, state):
+    history = []
+    pending = state.rows(limit=18, states=oss_delivery.DELIVERY_STATES)
+    seen = {(row["work"], row["number"]) for row in pending}
+    recent = [row for row in state.rows(limit=18) if (row["work"], row["number"]) not in seen]
+    for row in (pending + recent)[:18]:
+        assignment = json.loads(row["assignment"])
+        status = state.setting("job:" + assignment["job_id"]) or {}
+        details = dict(job_id=assignment["job_id"], work_id=row["work"], attempt=row["number"],
+                       kind=assignment["kind"], status=row["status"], message=row["message"],
+                       job_state=status.get("job_state"), delivery_versions=status.get("delivery_versions", []))
+        if "oss" in assignment:
+            details["oss_delivery"] = assignment["oss"]["delivery"]
+            if details["oss_delivery"] == "manual" and row["status"] in oss_delivery.DELIVERY_STATES:
+                directory = root / "work" / opaque(row["work"]) / str(row["number"])
+                path = oss_delivery.manual_path(directory, assignment)
+                if path.is_file():
+                    details["submission_path"] = str(path)
+        history.append(details)
+    return history
 
 
 class LeaseWatch:
@@ -161,6 +187,7 @@ class Scheduler:
         self.stop_after_drain = threading.Event()
         self.lock = threading.Lock()
         self.staleness = {}
+        self.delivery_checks = {}
         self.status = dict(connection="connecting", last_success=None)
         self.session = {}
         scope = key(config["server"], config["node_key"])
@@ -183,14 +210,7 @@ class Scheduler:
             progress = self.current(directory, attempt["progress"])
             attempts.append(dict(work_id=work, attempt=number, job_id=attempt["job_id"], kind=kind,
                                  **progress, details=panel_details(directory, progress, kind)))
-        history = []
-        for row in self.state.rows(limit=18):
-            assignment = json.loads(row["assignment"])
-            status = self.state.setting("job:" + assignment["job_id"]) or {}
-            history.append(dict(job_id=assignment["job_id"], work_id=row["work"], attempt=row["number"],
-                                kind=assignment["kind"], status=row["status"], message=row["message"],
-                                job_state=status.get("job_state"), delivery_versions=status.get("delivery_versions", [])))
-        return {**state, "active": attempts, "history": history}
+        return {**state, "active": attempts, "history": attempt_history(self.root, self.state)}
 
     @staticmethod
     def current(directory, fallback):
@@ -212,6 +232,7 @@ class Scheduler:
         next_poll = 0
         heartbeat_at = 0
         next_reconcile = 0
+        next_delivery_check = 0
         accept = True
         try:
             while not self.stop.is_set():
@@ -244,6 +265,9 @@ class Scheduler:
                         self.recover()
                         self.reconcile()
                         next_reconcile = time.monotonic() + 60
+                    if now >= next_delivery_check:
+                        self.poll_deliveries()
+                        next_delivery_check = time.monotonic() + 4
                     with self.lock:
                         free = self.cfg["slots"] - len(self.active)
                     enough = shutil.disk_usage(self.root).free >= self.cfg["disk_reserve_gib"] * 1024**3
@@ -303,6 +327,11 @@ class Scheduler:
             raise ValueError("工单和输入清单的标识不一致")
         if object_hash(order) != assignment["input_manifest_sha256"]:
             raise ValueError("输入清单摘要不匹配")
+        if "oss" in assignment:
+            oss_delivery.validate_assignment(assignment)
+            if assignment["oss"]["delivery"] == "auto" and not read_oss_keys(self.root):
+                raise WorkFailure(dict(code="dependency_unavailable", message="请在本机节点配置中保存 OSS AccessKey",
+                                       retryable=True))
         if "review_upload" in order and (order["kind"] != "revise" or order["review_upload"] != REJECTED_FRAMES_MODE):
             raise WorkFailure(dict(code="input_invalid", message="工单的审核包上传模式不受支持", retryable=False))
         roles = {artifact["role"]: artifact for artifact in order["artifacts"]}
@@ -388,8 +417,11 @@ class Scheduler:
                     raise
                 self.state.mark(assignment, status="interrupted", message=exc.code)
                 continue
-            if current.get("receipt") and current["receipt"]["attempt"] == row["number"]:
+            if (current["work_state"] == "succeeded" and current.get("receipt")
+                    and current["receipt"]["attempt"] == row["number"]):
                 self.state.mark(assignment, status="succeeded", receipt=current["receipt"])
+            elif self.update_delivery(assignment, current):
+                continue
             elif current["work_state"] == "leased" and current["attempt"] == row["number"]:
                 if free <= 0:
                     continue
@@ -411,6 +443,51 @@ class Scheduler:
                 else:
                     self.state.mark(assignment, status="interrupted", message=control["directive"])
             else:
+                self.state.mark(assignment, status="interrupted", message=current["work_state"])
+
+    def update_delivery(self, assignment, current):
+        if "oss" not in assignment or current["attempt"] != assignment["lease"]["attempt"]:
+            return False
+        state = current["work_state"]
+        if state in oss_delivery.DELIVERY_STATES:
+            message = ("云端校验未通过，请在 247 查看原因并重新上传正确批次的 ZIP"
+                       if state == "awaiting_manual" and current.get("failure") == "integrity_failed" else None)
+            self.state.mark(assignment, status=state, message=message)
+        elif state == "succeeded" and (receipt := current.get("receipt")) and receipt["attempt"] == current["attempt"]:
+            self.state.mark(assignment, status="succeeded", receipt=receipt)
+        elif state == "failed":
+            self.state.mark(assignment, status="failed", message=(current.get("failure_message") or current.get("failure")
+                                                                   or "云端交付校验失败"))
+        else:
+            return False
+        return True
+
+    def poll_deliveries(self):
+        rows = self.state.rows(states=oss_delivery.DELIVERY_STATES)
+        due = sorted(rows, key=lambda row: self.delivery_checks.get((row["work"], row["number"]), 0))
+        tracked = {(row["work"], row["number"]) for row in rows}
+        self.delivery_checks = {ident: when for ident, when in self.delivery_checks.items() if ident in tracked}
+        for row in due[:8]:
+            ident = (row["work"], row["number"])
+            now = time.monotonic()
+            interval = 4 if row["status"] == "verifying" else 20
+            if now - self.delivery_checks.get(ident, -interval) < interval:
+                continue
+            self.delivery_checks[ident] = now
+            assignment = json.loads(row["assignment"])
+            try:
+                current = self.work_status(assignment)
+            except ProtocolError as exc:
+                if exc.status != 404:
+                    raise
+                self.state.mark(assignment, status="interrupted", message=exc.code)
+                continue
+            self.state.set("job:" + assignment["job_id"], current)
+            if (current["attempt"] == row["number"] and current["work_state"] == row["status"]
+                    and not current.get("failure") and not row["message"]):
+                continue
+            if not self.update_delivery(assignment, current) and (current["attempt"] != row["number"]
+                    or current["work_state"] in {"stopped", "deleted", "queued", "paused"}):
                 self.state.mark(assignment, status="interrupted", message=current["work_state"])
 
     def reconcile(self):
@@ -493,8 +570,11 @@ class Scheduler:
                                 # runner to recreate the output set from its validated inputs.
                                 (directory / "result.json").unlink(missing_ok=True)
                             report("download")
+                            source_url = assignment.get("oss", {}).get("source_url")
                             with slot(self.root / "resources", "transfer", self.cfg["transfer_slots"], transfer.stop):
-                                paths = {role: str(transfer.download(artifact, directory)) for role, artifact in artifacts.items()}
+                                paths = {role: str(transfer.download(artifact, directory,
+                                             source_url=source_url if role == "source_video" else None))
+                                         for role, artifact in artifacts.items()}
                             if "review_storage" in assignment["input_manifest"] and assignment["kind"] != "prepare":
                                 paths["local_version"] = str(self.local_review_directory(assignment, artifacts["version_manifest"]["sha256"]))
                             if transfer.stop.is_set():
@@ -505,12 +585,20 @@ class Scheduler:
                             pending = self.upload_result(assignment, profile, checkpoint, directory, transfer)
                     report("commit_result")
                     events.send(dict(stage="commit_result", completed=0, total=None))
-                    receipt = transfer.json("POST", f"/work/{transfer.work}/complete", pending, "complete")
-                    self.state.mark(assignment, status="succeeded", receipt=receipt)
+                    if "oss" in assignment:
+                        expected = "verifying" if assignment["oss"]["delivery"] == "auto" else "awaiting_manual"
+                        response = transfer.json("POST", f"/work/{transfer.work}/oss/submit", pending, "oss-submit")
+                        if response["state"] != expected:
+                            raise ValueError("OSS 提交回执状态错误")
+                        self.state.mark(assignment, status=expected)
+                    else:
+                        receipt = transfer.json("POST", f"/work/{transfer.work}/complete", pending, "complete")
+                        self.state.mark(assignment, status="succeeded", receipt=receipt)
                 except (ValueError, KeyError, OSError, RuntimeError) as exc:
                     if not isinstance(exc, WorkFailure):
                         error = {"code": "input_invalid" if isinstance(exc, (ValueError, KeyError)) else "other",
-                                 "message": f"{progress()['stage']} · {type(exc).__name__}", "retryable": isinstance(exc, OSError)}
+                                 "message": str(exc) if isinstance(exc, ReviewFrameLimitError)
+                                 else f"{progress()['stage']} · {type(exc).__name__}", "retryable": isinstance(exc, OSError)}
                     else:
                         error = exc.body
                     events.send(dict(stage="report_failure", completed=0, total=None),
@@ -521,8 +609,10 @@ class Scheduler:
             try:
                 result = self.work_status(assignment)
                 receipt = result.get("receipt")
-                if receipt and receipt["attempt"] == assignment["lease"]["attempt"]:
+                if result["work_state"] == "succeeded" and receipt and receipt["attempt"] == assignment["lease"]["attempt"]:
                     self.state.mark(assignment, status="succeeded", receipt=receipt)
+                elif self.update_delivery(assignment, result):
+                    return
                 elif result["work_state"] != "leased" or result["attempt"] != assignment["lease"]["attempt"]:
                     self.state.mark(assignment, status="interrupted", message=watch.directive or result["work_state"])
                 else:
@@ -541,7 +631,9 @@ class Scheduler:
                            review_settings=self.review_settings(directory),
                            codex_lease_owner=transfer.resume_lease.owner)
             atomic_json(directory / "request.json", request)
-            env = {name: value for name, value in os.environ.items() if name != "FILM_WORKER_TOKEN"}
+            credentials = {"FILM_WORKER_TOKEN", "OSS_ACCESS_KEY_ID", "OSS_ACCESS_KEY_SECRET",
+                           "ALIBABA_CLOUD_ACCESS_KEY_ID", "ALIBABA_CLOUD_ACCESS_KEY_SECRET"}
+            env = {name: value for name, value in os.environ.items() if name.upper() not in credentials}
             env["PYTHONUTF8"] = "1"
             with (directory / "worker.log").open("ab") as log:
                 tree = ProcessTree([sys.executable, "-m", "film_worker", "child", str(directory)],
@@ -643,7 +735,7 @@ class Scheduler:
                 if decision.get("decision") == "approve":
                     return
                 if decision.get("decision") == "reject":
-                    raise WorkFailure({"code": "local_review_rejected", "message": "本地复核未通过，未上传产物",
+                    raise WorkFailure({"code": "other", "message": "本地复核未通过，未上传产物",
                                        "retryable": True})
             if transfer.stop.wait(1):
                 raise Interrupted
@@ -677,11 +769,19 @@ class Scheduler:
         return path
 
     def upload_result(self, assignment, profile, result, directory, transfer):
+        if "version_manifest" in result["outputs"]:
+            path = self.checkpoint_path(directory, result["attempt"], result["outputs"]["version_manifest"])
+            version = read(path)
+            check_review_frame_limit(version["frame_count"])
+        else:
+            verification = result["final_verification"]
+            check_review_frame_limit(verification["frame_count"])
         automatic = self.review_settings(directory).get("dual_role_review", False)
         if not automatic or profile.get("production_policy") == "human_required":
             self.await_local_review(assignment, result, directory, transfer)
         else:
             approved = result.get("automatic_review")
+            handoff = result.get("human_review")
             expected = {role: item["sha256"] for role, item in result["outputs"].items()}
             if assignment["kind"] == "finalize":
                 verification = result.get("final_verification", {})
@@ -689,22 +789,66 @@ class Scheduler:
                     raise WorkFailure(dict(code="integrity_failed", message="成片缺少技术校验结论", retryable=False))
                 scene_sha = verification.get("scene_sha256")
             else:
-                version = self.checkpoint_path(directory, result["attempt"], result["outputs"]["version_manifest"])
-                scene_sha = read(version)["scene_sha256"]
-            if (not isinstance(approved, dict) or approved.get("outputs_sha256") != expected
-                    or not approved.get("inspected") or not scene_sha or approved.get("scene_sha256") != scene_sha):
+                scene_sha = version["scene_sha256"]
+            evidence = approved if handoff is None else handoff
+            if (not isinstance(evidence, dict) or evidence.get("outputs_sha256") != expected
+                    or not scene_sha or evidence.get("scene_sha256") != scene_sha):
                 raise WorkFailure(dict(code="integrity_failed", message="送审产物与独立审核结论不匹配", retryable=False))
+            if handoff is None:
+                if not approved.get("inspected"):
+                    raise WorkFailure(dict(code="integrity_failed", message="缺少独立审核证据", retryable=False))
+            else:
+                if (assignment["kind"] not in {"prepare", "revise"} or approved is not None
+                        or handoff.get("verdict") != "needs_human_review" or handoff.get("reason") != "repair_limit"
+                        or handoff.get("stage") not in {"preview", "review"} or not handoff.get("issues")):
+                    raise WorkFailure(dict(code="integrity_failed", message="转人工审核的记录无效", retryable=False))
+                report_item = result["outputs"]["production_report"]
+                report_file = self.checkpoint_path(directory, result["attempt"], report_item)
+                note = {k: v for k, v in handoff.items() if k != "outputs_sha256"}
+                if (version["production_report_sha256"] != report_item["sha256"]
+                        or read(report_file).get("visual_review") != note):
+                    raise WorkFailure(dict(code="integrity_failed", message="制作报告缺少匹配的转人工审核记录", retryable=False))
         outputs = []
         if "review_storage" in assignment["input_manifest"] and "version_manifest" in result["outputs"]:
             manifest = result["outputs"]["version_manifest"]
-            version = self.checkpoint_path(directory, result["attempt"], manifest)
-            if not self.has_local_review(version.parent.parent, read(version)):
+            if not self.has_local_review(path.parent.parent, version):
                 raise WorkFailure(dict(code="input_invalid", message="本机送审版的无损帧或工程缺失，已停止送审", retryable=False))
             atomic_json(self.root / "local-reviews" / opaque(assignment["job_id"]) / (manifest["sha256"] + ".json"),
                         dict(work_id=transfer.work, attempt=result["attempt"]))
         report = Progress(directory)
         report("waiting_for_upload")
         with slot(self.root / "resources", "transfer", self.cfg["transfer_slots"], transfer.stop):
+            if "oss" in assignment:
+                paths = {role: self.checkpoint_path(directory, result["attempt"], artifact)
+                         for role, artifact in result["outputs"].items()}
+                payload = dict(input_manifest_sha256=assignment["input_manifest_sha256"])
+                automatic_delivery = assignment["oss"]["delivery"] == "auto"
+                if automatic_delivery:
+                    credentials = read_oss_keys(self.root)
+                    if not credentials:
+                        raise WorkFailure(dict(code="dependency_unavailable", message="请先保存本机 OSS AccessKey",
+                                               retryable=True))
+                try:
+                    if oss_delivery.uses_objects(assignment):
+                        files = oss_delivery.object_files(assignment, result["outputs"], paths, transfer.stop)
+                        if automatic_delivery:
+                            target = oss_delivery.begin_objects(assignment, payload, transfer)
+                            payload.update(upload_id=target["upload_id"], objects=oss_delivery.upload_objects(
+                                target, credentials, files, directory, transfer.stop, report))
+                            if assignment["kind"] == "finalize":
+                                payload["final_verification"] = result["final_verification"]
+                        else:
+                            oss_delivery.package_manual_objects(assignment, directory, files, result.get("final_verification"),
+                                                                transfer.stop, report)
+                    else:
+                        archive, metadata = oss_delivery.submission(assignment, result, directory, paths, transfer.stop, report)
+                        if automatic_delivery:
+                            oss_delivery.upload(archive, assignment["oss"]["upload"], credentials, transfer.stop, report)
+                            payload.update(metadata)
+                except oss_delivery.UploadFailure as exc:
+                    raise WorkFailure(dict(code="other", message=str(exc), retryable=exc.retryable)) from None
+                self.state.mark(assignment, pending=payload)
+                return payload
             for role, artifact in result["outputs"].items():
                 path = self.checkpoint_path(directory, result["attempt"], artifact)
                 stage = "upload_" + role

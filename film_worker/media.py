@@ -14,6 +14,7 @@ from PIL import Image
 
 from . import intake
 from .artifact_staging import staging_directory
+from .protocol import check_review_frame_limit
 
 
 def read_json(path):
@@ -43,8 +44,11 @@ def review_size(timeline):
 def prepare_source(directory, source, requested_width):
     ready = directory / "intake"
     if ready.is_dir():
-        return read_json(ready / "timeline.json")
+        timeline = read_json(ready / "timeline.json")
+        check_review_frame_limit(len(timeline["pts"]))
+        return timeline
     metadata, video, pts, base, duration, _ = intake.measure(source)
+    check_review_frame_limit(len(pts))
     sar = video.get("sample_aspect_ratio", "1:1")
     sar = Fraction(sar.replace(":", "/")) if sar not in ("0:1", "N/A", None) else Fraction(1)
     dw, dh = Fraction(video["width"]) * sar, Fraction(video["height"])

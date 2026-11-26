@@ -147,6 +147,7 @@ button.primary:hover:not(:disabled) { background: #194ca7; border-color: #194ca7
 .history-row + .history-row { border-top: 1px solid var(--line); }
 .history-identity { display: flex; align-items: baseline; flex-wrap: wrap; gap: 2px 10px; }
 .history-identity span { color: var(--muted); font-size: 12px; }
+.submission-path { display: block; flex-basis: 100%; overflow-wrap: anywhere; font-size: 12px; color: var(--muted); }
 .history-status { padding: 2px 8px; border: 1px solid var(--line); border-radius: 6px; color: var(--muted); font-size: 11px; white-space: nowrap; }
 .history-status[data-state=review], .history-status[data-state=running], .history-status[data-state=queued] { color: var(--warning); }
 .history-status[data-state=succeeded], .history-status[data-state=done] { color: var(--green); }

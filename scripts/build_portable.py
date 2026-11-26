@@ -86,17 +86,26 @@ def package_wheels(runtimes, target, cache):
     for package in lock["package"]:
         if package["name"] == "film-worker" or (package["name"] == "pywin32" and not target.startswith("windows")):
             continue
-        def suitable(file):
+        def score(file):
             name = PurePosixPath(urlsplit(file["url"]).path).name
-            if name.endswith("-py3-none-any.whl"):
-                return True
-            if "-cp312-" not in name:
-                return False
+            python, abi, platforms = name.removesuffix(".whl").rsplit("-", 3)[-3:]
+            if "py3" in python.split(".") and abi == "none" and platforms == "any":
+                return 0
+            if not python.startswith("cp3") or not python[3:].isdigit():
+                return -1
+            minor = int(python[3:])
+            if python != "cp312" and (abi != "abi3" or minor > 12):
+                return -1
             if target.startswith("windows"):
-                return name.endswith("-win_amd64.whl")
-            return "-macosx_" in name and name.endswith("_" + target.removeprefix("macos-") + ".whl")
+                return minor if platforms == "win_amd64" else -1
+            arch = target.removeprefix("macos-")
+            candidates = [tag for tag in platforms.split(".") if tag.startswith("macosx_")]
+            if any(tag.endswith("_" + arch) for tag in candidates):
+                return minor + 20
+            return minor if any(tag.endswith("_universal2") for tag in candidates) else -1
 
-        options = [file for file in package["wheels"] if suitable(file)]
+        best = max((score(file) for file in package["wheels"]), default=-1)
+        options = [file for file in package["wheels"] if best >= 0 and score(file) == best]
         if len(options) != 1:
             raise ValueError(f"{target} 没有唯一可分发的 wheel {package['name']}")
         artifact = options[0]
@@ -132,8 +141,9 @@ def bundle(args):
                      "启动执行端.cmd", "启动执行端.command"):
             shutil.copy2(ROOT / name, project / name)
         (project / "docs").mkdir()
-        handoff = Path("docs/服务端同机审片接入.md")
-        shutil.copy2(ROOT / handoff, project / handoff)
+        for filename in ("服务端同机审片接入.md", "服务端返修增量接入.md"):
+            handoff = Path("docs") / filename
+            shutil.copy2(ROOT / handoff, project / handoff)
         for name in ("release.json", "release.allowed_signers"):
             if (ROOT / name).is_file():
                 shutil.copy2(ROOT / name, project / name)

@@ -25,6 +25,7 @@ const jobStates = {
   queued: "排队中", running: "运行中", review: "待审核", done: "已交付",
   succeeded: "已提交", active: "运行中", paused: "已暂停", failed: "失败",
   interrupted: "已中断", stopped: "已停止", deleted: "已删除",
+  awaiting_manual: "待手动交付", verifying: "云端校验中",
 };
 const phaseNames = {
   input: "准备素材", author: "Codex 制作", revise: "Codex 返修", draft: "逐镜自检",
@@ -58,6 +59,7 @@ const steps = {
   package_delivery: ["delivery", "打包交付产物"], reuse_outputs: ["review", "复用已核验的本地产物"],
   prepare_local_review: ["review", "生成本地复核样张"], awaiting_local_review: ["review", "等待本地确认"],
   waiting_for_upload: ["upload", "等待上传槽位"], commit_result: ["upload", "提交结果并等待回执"],
+  package_oss: ["upload", "生成 OSS 交付包"], oss_upload: ["upload", "上传 OSS 交付包"],
 };
 const artifacts = {
   source_timeline: "源片时间线", scene_bundle: "Blender 工程包", shot_metadata: "镜头信息",
@@ -170,8 +172,8 @@ function showCounts(detail, job, step, extra, sample, now) {
   if (!(total > 0)) return;
   const done = Math.max(0, Math.min(total, Number(job.completed) || 0));
   const percent = done === total ? 100 : Math.floor(done * 100 / total);
-  const upload = job.stage.startsWith("upload_");
-  const amount = upload
+  const transfer = job.stage.startsWith("upload_") || ["package_oss", "oss_upload"].includes(job.stage);
+  const amount = transfer
     ? `${(done / 1048576).toFixed(1)} / ${(total / 1048576).toFixed(1)} MiB`
     : `${done.toLocaleString("zh-CN")} / ${total.toLocaleString("zh-CN")} 帧`;
   const header = element("div", "job-counts");
@@ -368,12 +370,15 @@ async function refresh() {
       const identity = element("div", "history-identity");
       identity.append(element("strong", "", `工单 ${item.job_id}`),
                       element("span", "", `${jobKinds[item.kind] ?? item.kind} · 第 ${item.attempt} 次尝试`));
-      const status = ["failed", "interrupted"].includes(item.status) ? item.status : item.job_state ?? item.status;
-      const label = element("span", "history-status", jobStates[status] ?? status);
+      const status = item.oss_delivery || ["failed", "interrupted"].includes(item.status)
+        ? item.status : item.job_state ?? item.status;
+      const label = element("span", "history-status", item.oss_delivery && status === "succeeded"
+        ? (item.kind === "finalize" ? "已交付" : "已送审") : jobStates[status] ?? status);
       label.dataset.state = status;
-      if (item.message) label.title = item.message;
+      if (item.message) identity.append(element("span", "submission-path", item.message));
       const delivery = (item.delivery_versions ?? []).join("、");
       if (delivery) identity.append(element("span", "", `交付版 ${delivery}`));
+      if (item.submission_path) identity.append(element("code", "submission-path", item.submission_path));
       line.append(identity, label);
       return line;
     });
@@ -390,6 +395,10 @@ async function openPanel() {
   try {
     const data = await api("config");
     csrf = data.csrf;
+    if (typeof data.oss_configured === "boolean") {
+      document.querySelector("#oss-settings").hidden = false;
+      showOssKeyStatus(data.oss_configured);
+    }
     for (const [key, value] of Object.entries(data.config)) {
       const field = form.elements.namedItem(key);
       if (field?.type === "checkbox") field.checked = value;
@@ -409,17 +418,31 @@ form.addEventListener("submit", async event => {
     const config = Object.fromEntries(new FormData(form));
     const token = config.token;
     delete config.token;
+    const id = config.oss_key_id.trim();
+    const secret = config.oss_key_secret.trim();
+    delete config.oss_key_id;
+    delete config.oss_key_secret;
+    if (Boolean(id) !== Boolean(secret)) throw new Error("请同时填写 OSS AccessKey ID 和 Secret");
+    const oss_keys = id ? {id, secret} : undefined;
     config.auto_update = form.elements.namedItem("auto_update").checked;
     config.dual_role_review = form.elements.namedItem("dual_role_review").checked;
     for (const field of form.querySelectorAll("input[type=number]")) config[field.name] = Number(field.value);
-    await api("config", {config, token});
+    await api("config", {config, token, oss_keys});
     form.elements.namedItem("token").value = "";
+    form.elements.namedItem("oss_key_id").value = "";
+    form.elements.namedItem("oss_key_secret").value = "";
+    if (oss_keys) showOssKeyStatus(true);
     document.querySelector("#address").textContent = config.server || "本机控制面板";
     message("配置已保存");
   } catch (error) {
     message(error.message, true);
   }
 });
+
+function showOssKeyStatus(configured) {
+  document.querySelector("#oss-key-status").textContent = configured ?
+    "已保存在系统凭据库，留空沿用。" : "自动交付需要配置。手动交付由服务端为设备指定。";
+}
 
 const navigation = document.querySelectorAll(".sidebar nav a");
 function showLocation() {

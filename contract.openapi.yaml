@@ -559,6 +559,14 @@ paths:
               schema:
                 type: string
                 format: binary
+        '302':
+          description: OSS 工件下载地址。新 GET 只携带 Range，按冻结清单的长度和摘要校验响应。
+          headers:
+            Location:
+              required: true
+              schema:
+                type: string
+                format: uri
         '400':
           $ref: '#/components/responses/BadRequest'
         '401':
@@ -575,6 +583,122 @@ paths:
           $ref: '#/components/responses/Busy'
         '503':
           $ref: '#/components/responses/Unavailable'
+  /work/{work_id}/oss/objects:
+    post:
+      operationId: beginOssObjects
+      summary: 为当前自动交付批次分配 OSS 对象目录
+      parameters:
+      - $ref: '#/components/parameters/WorkID'
+      - $ref: '#/components/parameters/Lease'
+      - $ref: '#/components/parameters/Fence'
+      - $ref: '#/components/parameters/Attempt'
+      - $ref: '#/components/parameters/Idempotency'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [input_manifest_sha256]
+              properties:
+                input_manifest_sha256:
+                  $ref: '#/components/schemas/Sha256'
+      responses:
+        '201':
+          description: 分配成功，上传文件使用 key 目录下的固定名称。
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [upload_id, region, bucket, key]
+                properties:
+                  upload_id:
+                    $ref: '#/components/schemas/ID'
+                  region:
+                    type: string
+                  bucket:
+                    type: string
+                  key:
+                    type: string
+  /work/{work_id}/oss/submit:
+    post:
+      operationId: submitOssDelivery
+      summary: 登记当前领取批次的 OSS 交付
+      parameters:
+      - $ref: '#/components/parameters/WorkID'
+      - $ref: '#/components/parameters/Lease'
+      - $ref: '#/components/parameters/Fence'
+      - $ref: '#/components/parameters/Attempt'
+      - $ref: '#/components/parameters/Idempotency'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [input_manifest_sha256]
+              dependentRequired:
+                sha256: [size_bytes]
+                size_bytes: [sha256]
+                upload_id: [objects]
+                objects: [upload_id]
+                final_verification: [objects]
+              properties:
+                input_manifest_sha256:
+                  $ref: '#/components/schemas/Sha256'
+                sha256:
+                  $ref: '#/components/schemas/Sha256'
+                size_bytes:
+                  type: integer
+                  minimum: 1
+                  maximum: 17179869184
+                upload_id:
+                  $ref: '#/components/schemas/ID'
+                objects:
+                  type: object
+                  minProperties: 1
+                  additionalProperties:
+                    type: object
+                    additionalProperties: false
+                    required: [size_bytes, sha256, version_id]
+                    properties:
+                      size_bytes:
+                        type: integer
+                        minimum: 1
+                        maximum: 17179869184
+                      sha256:
+                        $ref: '#/components/schemas/Sha256'
+                      version_id:
+                        type: string
+                        minLength: 1
+                        maxLength: 256
+                final_verification:
+                  $ref: '#/components/schemas/FinalVerification'
+              description: objects_v1 自动交付提交上传 ID 和各对象声明，出片同时提交核验记录。旧自动交付提交 ZIP 摘要和字节数。手动交付只提交工单清单摘要。
+      responses:
+        '202':
+          description: 服务端已登记交付并结束续租。通过作业状态接口查询最终回执。
+          content:
+            application/json:
+              schema:
+                oneOf:
+                - type: object
+                  required: [state, transfer_id]
+                  properties:
+                    state:
+                      const: verifying
+                    transfer_id:
+                      $ref: '#/components/schemas/ID'
+                - type: object
+                  required: [state]
+                  properties:
+                    state:
+                      const: awaiting_manual
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Invalid'
   /work/{work_id}/complete:
     post:
       operationId: completeWork
@@ -1013,6 +1137,8 @@ components:
       enum:
       - queued
       - leased
+      - awaiting_manual
+      - verifying
       - succeeded
       - paused
       - stopped
@@ -1023,6 +1149,8 @@ components:
       enum:
       - queued
       - running
+      - awaiting_manual
+      - verifying
       - review
       - supplement
       - done
@@ -1165,6 +1293,12 @@ components:
       - render_backends
       - environment
       properties:
+        oss_delivery:
+          type: boolean
+          description: 支持 OSS 原片下载及自动和手动交付。
+        oss_objects:
+          type: boolean
+          description: 支持 OSS 对比图逐个直传和成片整包交付。
         work_kinds:
           type: array
           items:
@@ -1671,6 +1805,34 @@ components:
           $ref: '#/components/schemas/InputManifest'
         input_manifest_sha256:
           $ref: '#/components/schemas/Sha256'
+        oss:
+          type: object
+          additionalProperties: false
+          required: [source_url, delivery, upload]
+          properties:
+            protocol:
+              enum: [objects_v1, zip_v1]
+            review_scope:
+              enum: [all_frames, rejected_frames, null]
+            source_url:
+              type: string
+              format: uri
+            delivery:
+              enum: [auto, manual]
+            upload:
+              oneOf:
+              - type: 'null'
+              - type: object
+                additionalProperties: false
+                required: [region, bucket, key]
+                properties:
+                  region:
+                    type: string
+                  bucket:
+                    type: string
+                  key:
+                    type: string
+          description: 领取批次的交付设置，位于 input_manifest 之外。objects_v1 自动模式在开始上传时另行申请目录，旧自动模式在 upload 中提供 ZIP 位置。手动模式的 upload 为 null。
       description: input_manifest_sha256 为 input_manifest 完整 JCS 的 SHA-256；所有作业输入均可由新节点从管理端下载。
     WorkHeartbeat:
       type: object
@@ -2581,6 +2743,13 @@ components:
         reason:
           type: string
           minLength: 1
+        stage:
+          type: [string, 'null']
+        failure:
+          type: [string, 'null']
+        failure_message:
+          type: [string, 'null']
+          description: OSS 交付校验失败详情。
         receipt:
           $ref: '#/components/schemas/Receipt'
       description: 节点仅能查询自己领取过的 work_id 所属作业。terminal 指所查 work；succeeded/failed/stopped/deleted 为 true。暂停可恢复，queued/leased

@@ -331,11 +331,20 @@ production = Scheduler.produce
 def fixture_outputs(node, assignment, profile, paths, directory, transfer, progress):
     env = environment(node.cfg, node.versions, profile)
     outputs = {}
+    scene_sha = sha(b"fixture-scene")
     for role in ROLES[assignment["kind"]]:
         path = directory/(role+".bin")
-        path.write_bytes((role+assignment["kind"]).encode())
+        if role == "version_manifest":
+            atomic_json(path, dict(frame_count=3, scene_sha256=scene_sha))
+        else:
+            path.write_bytes((role+assignment["kind"]).encode())
         outputs[role] = str(path)
-    atomic_json(directory/"result.json", dict(outputs=outputs, environment=env))
+    result = dict(outputs=outputs, environment=env,
+                  automatic_review=dict(scene_sha256=scene_sha, inspected=[1],
+                                        outputs_sha256={role: sha(Path(path).read_bytes()) for role, path in outputs.items()}))
+    if assignment["kind"] == "finalize":
+        result["final_verification"] = dict(frame_count=3, scene_sha256=scene_sha, pts_verified=True, audio_verified=True)
+    atomic_json(directory/"result.json", result)
     return production(node, assignment, profile, paths, directory, transfer, progress)
 
 

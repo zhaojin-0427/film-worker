@@ -7,6 +7,6 @@
   ],
   "protocol": 1,
   "state_format": 1,
-  "lock_sha256": "612a7c572921e5a7c774372dba5f7026e2d6982202c7ee30258dafe715a780c5",
+  "lock_sha256": "0168f7cb7e66a65f65dda5f8ca4d259ead26af078c4251c80a20205f96bc7d68",
   "update_remote": "https://github.com/zgw494294-blip/film-worker.git"
 }

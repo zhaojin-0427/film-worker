@@ -14,9 +14,10 @@ from . import model, startup
 from .model_recovery import location as recovery_location, write_state as write_recovery_state
 from .progress import panel_details
 from .releases import RESTART_FOR_UPDATE, Releases
-from .scheduler import Scheduler
-from .secrets import read_token, store_token
+from .scheduler import Scheduler, attempt_history
+from .secrets import read_oss_keys, read_token, store_oss_keys, store_token
 from .settings import REVIEW_FIELDS, atomic_json, inspect_tools, load, resolve_tools, validate_config
+from .state import State
 
 
 WEB = Path(__file__).with_name("web")
@@ -70,7 +71,8 @@ class Panel(ThreadingHTTPServer):
                       rollback_available=release["previous"] is not None)
         if self.scheduler and self.runner and self.runner.is_alive():
             return {**self.scheduler.summary(), **detail}
-        return dict(connection="stopped", active=[], draining=False, detail=self.start_error, **detail)
+        history = attempt_history(self.root, State(self.root)) if (self.root / "worker.sqlite3").is_file() else []
+        return dict(connection="stopped", active=[], history=history, draining=False, detail=self.start_error, **detail)
 
     def update(self, *, rollback=False):
         if not self.managed:
@@ -186,7 +188,12 @@ class Handler(BaseHTTPRequestHandler):
                         return self.reply(200, sample.read_bytes(), "image/jpeg")
             return self.reply(404, {"error": "找不到复核样张"})
         if path == "/api/config":
-            return self.reply(200, {"config": load(self.server.config), "csrf": self.server.csrf})
+            try:
+                oss_configured = bool(read_oss_keys(self.server.root))
+            except (ValueError, OSError):
+                oss_configured = False
+            return self.reply(200, {"config": load(self.server.config), "csrf": self.server.csrf,
+                                    "oss_configured": oss_configured})
         assets = {"/": ("index.html", "text/html"), "/panel.css": ("panel.css", "text/css"),
                   "/panel.js": ("panel.js", "text/javascript")}
         if path not in assets:
@@ -249,10 +256,11 @@ class Handler(BaseHTTPRequestHandler):
             with node.lock:
                 if self.path == "/api/config":
                     config = validate_config(payload["config"])
+                    oss_keys = payload.get("oss_keys")
                     if node.runner and node.runner.is_alive():
                         prior = load(node.config)
                         changing_other = any(config[key] != prior[key] for key in config if key not in REVIEW_FIELDS)
-                        if changing_other or payload.get("token"):
+                        if changing_other or payload.get("token") or oss_keys:
                             raise ValueError("运行中可以保存审片设置。其他设置需等待在途工单完成并停止节点")
                         with node.scheduler.lock:
                             atomic_json(node.config, config)
@@ -260,6 +268,8 @@ class Handler(BaseHTTPRequestHandler):
                         return self.reply(200, {"saved": True})
                     if payload.get("token"):
                         store_token(node.root, payload["token"])
+                    if oss_keys:
+                        store_oss_keys(node.root, oss_keys["id"], oss_keys["secret"])
                     atomic_json(node.config, config)
                     return self.reply(200, {"saved": True})
                 if self.path == "/api/probe":

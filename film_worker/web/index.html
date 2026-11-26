@@ -83,6 +83,14 @@
           <label>建模 Token<input name="token" type="password" placeholder="留空沿用已保存的 Token" autocomplete="new-password"></label>
         </div>
       </fieldset>
+      <fieldset id="oss-settings" hidden>
+        <legend>OSS 自动交付</legend>
+        <div class="grid">
+          <label>AccessKey ID<input name="oss_key_id" type="password" autocomplete="new-password"></label>
+          <label>AccessKey Secret<input name="oss_key_secret" type="password" autocomplete="new-password"></label>
+        </div>
+        <p id="oss-key-status" class="settings-hint"></p>
+      </fieldset>
       <fieldset>
         <legend>模型</legend>
         <div class="grid">

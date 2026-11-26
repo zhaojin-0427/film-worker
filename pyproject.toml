@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Remote film production worker for macOS and Windows"
 requires-python = ">=3.12,<3.13"
 dependencies = [
+    "alibabacloud-oss-v2==1.3.2",
     "av==19.0.2",
     "Pillow==13.0.0",
     "rfc8785>=0.1.4,<0.2",

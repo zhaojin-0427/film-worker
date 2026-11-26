@@ -23,7 +23,7 @@ class ProductionTests(unittest.TestCase):
             root = Path(raw)
             clip = root / "input.mp4"
             subprocess.run([tools["ffmpeg"], "-v", "error", "-f", "lavfi", "-i",
-                            "color=s=160x90:r=24", "-frames:v", "3", "-c:v", "libx264", str(clip)], check=True)
+                            "color=s=160x90:r=24", "-frames:v", "3", "-c:v", "mpeg4", str(clip)], check=True)
             work = root / "work"
             work.mkdir()
             order = dict(kind="prepare", job_id="fixture", target_version=1, artifacts=[

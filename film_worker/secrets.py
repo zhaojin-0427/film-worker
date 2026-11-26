@@ -1,5 +1,6 @@
 """Node token in the macOS Keychain or Windows Credential Manager."""
 import hashlib
+import json
 import os
 import subprocess
 
@@ -12,7 +13,10 @@ def read_token(root):
     inherited = os.environ.get("FILM_WORKER_TOKEN")
     if inherited:
         return inherited
-    target = label(root)
+    return read_secret(label(root))
+
+
+def read_secret(target):
     if os.name == "nt":
         import win32cred
         from pywintypes import error
@@ -31,23 +35,44 @@ def read_token(root):
 def store_token(root, token):
     if not token.isascii() or not 1 <= len(token) <= 1024 or any(char.isspace() for char in token):
         raise ValueError("建模 Token 格式错误")
-    target = label(root)
+    store_secret(label(root), token)
+
+
+def read_oss_keys(root):
+    value = read_secret(label(root) + "/oss")
+    if not value:
+        return None
+    keys = json.loads(value)
+    if not isinstance(keys, list) or len(keys) != 2 or not all(isinstance(key, str) and key for key in keys):
+        raise ValueError("本机 OSS AccessKey 记录无效，请重新保存")
+    return tuple(keys)
+
+
+def store_oss_keys(root, access_key_id, access_key_secret):
+    if not all(isinstance(value, str) and 1 <= len(value) <= 128 and value.isascii()
+               and all(33 <= ord(char) <= 126 for char in value)
+               for value in (access_key_id, access_key_secret)):
+        raise ValueError("请同时填写有效的 OSS AccessKey ID 和 Secret")
+    store_secret(label(root) + "/oss", json.dumps([access_key_id, access_key_secret]))
+
+
+def store_secret(target, value):
     if os.name == "nt":
         import win32cred
         from pywintypes import error
         try:
             win32cred.CredWrite(dict(Type=win32cred.CRED_TYPE_GENERIC, TargetName=target,
                                     Persist=win32cred.CRED_PERSIST_LOCAL_MACHINE,
-                                    CredentialBlob=token), 0)
+                                    CredentialBlob=value), 0)
         except error as exc:
             raise windows_credential_error(exc, "保存") from exc
     else:
-        # Feed security's command interpreter via stdin so the token stays out of process arguments.
+        # Feed security's command interpreter via stdin so the secret stays out of process arguments.
         import shlex
-        line = 'add-generic-password -U -s ' + target + ' -a worker -w ' + shlex.quote(token)
+        line = 'add-generic-password -U -s ' + target + ' -a worker -w ' + shlex.quote(value)
         result = subprocess.run(["/usr/bin/security", "-i"], input=line+"\n", capture_output=True,
                                 text=True, check=False)
-        if result.returncode != 0 or read_token(root) != token:
+        if result.returncode != 0 or read_secret(target) != value:
             raise ValueError("macOS 钥匙串保存失败")
 
 

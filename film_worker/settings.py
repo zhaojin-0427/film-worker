@@ -301,7 +301,7 @@ def registration(config, instance_id, versions):
     available = sorted({"cpu", env["render_backend"]})
     result = dict(instance_id=instance_id, display_name=config["display_name"],
                   capabilities=dict(work_kinds=KINDS, slots=config["slots"], max_frame_width=3840,
-                                    render_backends=available, environment=env))
+                                    render_backends=available, environment=env, oss_delivery=True, oss_objects=True))
     if node_key:
         result["node_key"] = node_key
     return result

@@ -17,6 +17,22 @@ REVIEW_STORAGE_HEADER = "X-Film-Worker-Review-Storage"
 LOCAL_REVIEW_MODE = "node_local_v1"
 REVIEW_UPLOAD_HEADER = "X-Film-Worker-Review-Upload"
 REJECTED_FRAMES_MODE = "rejected_frames_v1"
+MAX_REVIEW_FRAMES = 2400
+OSS_OBJECTS = "objects_v1"
+OSS_REGION = re.compile(r"cn-[a-z0-9]+(?:-[a-z0-9]+)*\Z")
+OSS_BUCKET = re.compile(r"[a-z0-9][a-z0-9-]{1,61}[a-z0-9]\Z")
+
+
+def oss_url(url):
+    if not isinstance(url, str) or any(c.isspace() or ord(c) < 32 for c in url):
+        raise ValueError("OSS 下载地址无效")
+    parsed = urlsplit(url)
+    host = parsed.hostname or ""
+    match = re.fullmatch(r"([^.]*)\.oss-(cn-[a-z0-9-]+)\.aliyuncs\.com", host)
+    if (parsed.scheme != "https" or parsed.netloc != host or parsed.fragment or not match
+            or not OSS_BUCKET.fullmatch(match[1]) or not OSS_REGION.fullmatch(match[2])):
+        raise ValueError("OSS 下载地址必须是阿里云 OSS 的 HTTPS 地址")
+    return url
 
 
 class ProtocolError(Exception):
@@ -30,6 +46,27 @@ class ProtocolError(Exception):
 
 class Interrupted(Exception):
     """The current process no longer has permission to continue the work."""
+
+
+class ReviewFrameLimitError(ValueError):
+    def __init__(self, count):
+        super().__init__(f"原片共有 {count:,} 帧，超过单个审核工单的 {MAX_REVIEW_FRAMES:,} 帧上限")
+
+
+def check_review_frame_limit(count):
+    if type(count) is not int or count < 1:
+        raise ValueError("审核帧数无效")
+    if count > MAX_REVIEW_FRAMES:
+        raise ReviewFrameLimitError(count)
+
+
+class OSSRedirect(Exception):
+    def __init__(self, url):
+        self.url = url
+
+
+class OSSAccessDenied(ValueError):
+    """The current OSS download URL no longer authorizes access."""
 
 
 class NoRedirects(HTTPRedirectHandler):
@@ -79,8 +116,9 @@ class Client:
                 context.load_verify_locations(cafile=str(ca_file))
                 handlers.append(HTTPSHandler(context=context))
         self.opener = build_opener(*handlers)
+        self.oss_opener = build_opener(NoRedirects())
 
-    def open(self, method, path, *, body=None, headers=None, timeout=12):
+    def open(self, method, path, *, body=None, headers=None, timeout=12, oss_redirect=False):
         request_headers = {"Authorization": "Bearer " + self.token, **(headers or {})}
         if body is not None and not isinstance(body, bytes):
             body = json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode()
@@ -90,6 +128,8 @@ class Client:
             return self.opener.open(request, timeout=timeout)
         except HTTPError as response:
             with response:
+                if oss_redirect and response.code == 302:
+                    raise OSSRedirect(oss_url(response.headers.get("Location"))) from None
                 retry_after = response.headers.get("Retry-After", "")
                 try:
                     error = json.loads(response.read(65536))
@@ -105,6 +145,19 @@ class Client:
                                     int(retry_after) if retry_after.isdecimal() else None) from None
         except (URLError, socket.timeout, ConnectionError, http.client.HTTPException):
             raise ProtocolError(0, "network_unavailable", True) from None
+
+    def open_oss(self, url, position):
+        headers = {"Range": f"bytes={position}-"} if position else {}
+        try:
+            return self.oss_opener.open(Request(oss_url(url), headers=headers, method="GET"), timeout=15)
+        except HTTPError as response:
+            with response:
+                if response.code in {408, 429, 500, 502, 503, 504}:
+                    raise ProtocolError(response.code, "oss_download_unavailable", True) from None
+                error = OSSAccessDenied if response.code in {401, 403} else ValueError
+                raise error(f"OSS 下载失败（HTTP {response.code}）") from None
+        except (URLError, socket.timeout, ConnectionError, http.client.HTTPException):
+            raise ProtocolError(0, "oss_download_unavailable", True) from None
 
     def json(self, method, path, *, body=None, headers=None, timeout=12):
         try:
@@ -149,7 +202,7 @@ class Transfer:
             headers["Idempotency-Key"] = key(self.work, self.headers["X-Lease-Id"], action)
         return self.retry(lambda: self.api.json(method, path, body=body, headers=headers)[0])
 
-    def download(self, artifact, working):
+    def download(self, artifact, working, *, source_url=None):
         from .state import slot
 
         expected = valid_digest(artifact["sha256"])
@@ -160,6 +213,7 @@ class Transfer:
         etag = f'"{expected}"'
 
         def transfer():
+            nonlocal source_url
             if target.is_file() and target.stat().st_size == size and digest(target) == expected:
                 return target
             position = partial.stat().st_size if partial.exists() else 0
@@ -172,8 +226,22 @@ class Transfer:
             headers = dict(self.headers)
             if position:
                 headers.update(Range=f"bytes={position}-", **{"If-Range": etag})
-            with self.api.open("GET", path, headers=headers) as response:
-                if response.headers.get("ETag") != etag:
+            external = False
+            if source_url is not None:
+                try:
+                    response = self.api.open_oss(source_url, position)
+                    external = True
+                except OSSAccessDenied:
+                    # A claim URL can expire before production resumes. Refresh through the manager.
+                    source_url = None
+            if not external:
+                try:
+                    response = self.api.open("GET", path, headers=headers, oss_redirect=True)
+                except OSSRedirect as redirect:
+                    external = True
+                    response = self.api.open_oss(redirect.url, position)
+            with response:
+                if not external and response.headers.get("ETag") != etag:
                     raise ValueError("下载对象 ETag 与冻结清单不符")
                 if response.status == 206:
                     if response.headers.get("Content-Range") != f"bytes {position}-{size-1}/{size}":
