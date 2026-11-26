@@ -132,6 +132,7 @@ class WholeMediaSimulation(unittest.TestCase):
             config = node_config(service)
             config["render_backend"] = "cpu"
             config["cpu_threads"] = 2
+            config["final_width"] = 3840
             config.update(tool_overrides())
             tools = resolve_tools(config)
             clip = root/"input.mp4"
