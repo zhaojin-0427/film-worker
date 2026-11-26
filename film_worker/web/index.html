@@ -1,66 +1,146 @@
 <!doctype html>
 <html lang="zh-CN">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>电影复刻执行端</title><link rel="stylesheet" href="/panel.css"></head>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#121312">
+  <title>电影复刻执行端</title>
+  <link rel="stylesheet" href="/panel.css">
+  <script defer src="/panel.js"></script>
+</head>
 <body>
-<main>
-<header><div><h1>电影复刻执行端</h1><p id="address"></p></div><span id="connection" role="status">读取中</span></header>
-<section aria-labelledby="jobs-title">
-<div class="row"><h2 id="jobs-title">制作工单</h2><div class="actions">
-<button data-control="start">启动节点</button><button data-control="drain">暂停领单</button>
-<button data-control="resume">恢复领单</button><button data-control="stop">停止节点</button></div></div>
-<p id="capacity"></p><ul id="jobs"></ul>
-<details><summary>近期记录</summary><ul id="history"></ul></details>
-</section>
-<form id="form">
-<div class="row"><h2>节点配置</h2><button type="button" data-control="probe">检测本机工具</button></div>
-<fieldset><legend>连接</legend><div class="grid">
-<label>服务地址<input name="server" placeholder="https://workbench.example.com"></label>
-<label>节点标识（兼容旧服务）<input name="node_key" autocomplete="off"></label>
-<label>显示名称<input name="display_name"></label>
-<label>建模 Token<input name="token" type="password" placeholder="留空沿用已保存的 Token" autocomplete="new-password"></label>
-</div></fieldset>
-<fieldset><legend>并发和渲染</legend><div class="grid">
-<label>总工单<input name="slots" type="number" min="1" max="128" required></label>
-<label>Codex 进程<input name="model_slots" type="number" min="1" max="128" required></label>
-<label>Blender 进程<input name="render_slots" type="number" min="1" max="128" required></label>
-<label>传输并发<input name="transfer_slots" type="number" min="1" max="128" required></label>
-<label>单次渲染线程<input name="cpu_threads" type="number" min="1" max="128" required></label>
-<label>预留磁盘 GiB<input name="disk_reserve_gib" type="number" min="1" max="128" required></label>
-<label>设备<select name="render_backend"><option>auto</option><option>cpu</option><option>metal</option><option>cuda</option><option>optix</option><option>hip</option><option>oneapi</option></select></label>
-</div></fieldset>
-<details open><summary>制作设置</summary>
-<div class="grid model">
-<label>服务商<input name="codex_provider" placeholder="使用本机 Codex 默认设置"></label>
-<label>模型<input name="codex_model" placeholder="使用本机 Codex 默认设置"></label>
-<label>推理强度<input name="reasoning_effort" placeholder="使用本机 Codex 默认设置"></label>
+<aside class="sidebar">
+  <a class="brand" href="#workbench">
+    <span class="brand-mark" aria-hidden="true"></span>
+    <span>电影复刻<small>执行端</small></span>
+  </a>
+  <nav aria-label="工作台导航">
+    <a href="#workbench" aria-current="location"><span class="nav-icon icon-work" aria-hidden="true"></span>制作工单</a>
+    <a href="#history-panel"><span class="nav-icon icon-history" aria-hidden="true"></span>近期记录</a>
+    <a href="#review-settings"><span class="nav-icon icon-review" aria-hidden="true"></span>审片设置</a>
+    <a href="#node-settings"><span class="nav-icon icon-node" aria-hidden="true"></span>节点配置</a>
+  </nav>
+  <div class="sidebar-footer">
+    <span id="connection" role="status">读取中</span>
+    <p id="address"></p>
+  </div>
+</aside>
 
-</div>
-<div class="actions"><button id="test-model" type="button">测试已保存模型</button></div>
-</details>
-<details><summary>工具路径</summary><div class="grid">
-<label>Codex CLI<input name="codex"></label><label>Blender<input name="blender"></label>
-<label>FFmpeg<input name="ffmpeg"></label><label>FFprobe<input name="ffprobe"></label>
-</div></details>
-<details id="login"><summary>登录启动</summary>
-<p id="login-status">正在检查登录启动</p>
-<div class="actions"><button type="button" id="login-toggle" disabled>启用登录启动</button></div>
-</details>
-<details><summary>Git 更新</summary>
-<div class="grid">
-<label>Git 仓库<input name="update_remote" placeholder="https://…"></label>
-<label>发布标签<input name="update_tag"></label>
-<label>可信公钥文件<input name="update_signers" placeholder="allowed_signers 的本机绝对路径"></label>
-<label>检查间隔（分钟）<input name="update_interval_minutes" type="number" min="1" max="1440" required></label>
-<label>自动检查开始时间<input name="update_window_start" type="time"></label>
-<label>自动检查结束时间<input name="update_window_end" type="time"></label>
-</div>
-<label class="toggle"><input name="auto_update" type="checkbox">启用自动更新</label>
-<p>时段按本机时间，留空可全天检查。安装时先等本机在途工单提交。</p>
-<div class="actions"><button type="button" data-control="update">检查并更新</button>
-<button type="button" data-control="rollback">回退上个版本</button></div>
-<p id="update-status"></p></details>
-<footer><button type="submit">保存配置</button><output id="notice" aria-live="polite"></output></footer>
-</form>
+<main id="workbench">
+  <header class="page-header">
+    <div>
+      <h1>制作工单</h1>
+      <p id="capacity">正在读取节点状态</p>
+    </div>
+    <div class="actions node-actions" aria-label="节点操作">
+      <button type="button" data-control="start">启动节点</button>
+      <button type="button" data-control="stop">停止节点</button>
+      <button type="button" data-control="drain">暂停领单</button>
+      <button type="button" class="primary" data-control="resume">恢复领单</button>
+    </div>
+  </header>
+
+  <dl class="overview" aria-label="节点概况">
+    <div><dt>运行槽位</dt><dd id="slot-status">—</dd></div>
+    <div><dt>可用磁盘</dt><dd id="disk-status">—</dd></div>
+    <div><dt>Blender</dt><dd id="blender-status">—</dd></div>
+  </dl>
+
+  <section class="surface queue-panel" aria-labelledby="active-title">
+    <div class="section-heading"><h2 id="active-title">正在运行</h2><span id="queue-status" class="queue-status"></span></div>
+    <ul id="jobs"></ul>
+    <div id="local-review" hidden></div>
+  </section>
+
+  <section class="surface history-panel" id="history-panel" aria-labelledby="history-title">
+    <div class="section-heading"><h2 id="history-title">近期记录</h2></div>
+    <ul id="history"></ul>
+  </section>
+
+  <form id="form">
+    <section class="surface settings-panel" id="review-settings" aria-labelledby="review-title">
+      <div class="section-heading"><h2 id="review-title">审片设置</h2><button type="submit" class="primary">保存配置</button></div>
+      <div class="settings-grid">
+        <label>审片清晰度
+          <select name="review_clarity"><option value="fine">精细</option><option value="standard" selected>标准</option><option value="economy">省流</option></select>
+        </label>
+        <label class="switch-card">
+          <span>双角色自动送审<small>独立审核通过后自动上传。关闭后在本机确认。</small></span>
+          <input type="checkbox" role="switch" name="dual_role_review" checked>
+        </label>
+      </div>
+      <p class="settings-hint">审片设置从下一条领到的工单生效。</p>
+    </section>
+
+    <section class="surface settings-panel" id="node-settings" aria-labelledby="node-title">
+      <div class="section-heading"><h2 id="node-title">节点配置</h2><button type="button" data-control="probe">检测本机工具</button></div>
+      <fieldset>
+        <legend>连接</legend>
+        <div class="grid">
+          <label>服务地址<input name="server" placeholder="https://workbench.example.com"></label>
+          <label>节点标识（兼容旧服务）<input name="node_key" autocomplete="off"></label>
+          <label>显示名称<input name="display_name"></label>
+          <label>建模 Token<input name="token" type="password" placeholder="留空沿用已保存的 Token" autocomplete="new-password"></label>
+        </div>
+      </fieldset>
+      <fieldset>
+        <legend>模型</legend>
+        <div class="grid">
+          <label>服务商<input name="codex_provider" placeholder="使用本机默认设置"></label>
+          <label>模型<input name="codex_model" placeholder="使用本机默认设置"></label>
+          <label>推理强度<input name="reasoning_effort" placeholder="使用本机默认设置"></label>
+        </div>
+        <div class="actions field-actions"><button id="test-model" type="button">测试已保存模型</button></div>
+      </fieldset>
+      <fieldset>
+        <legend>并发和渲染</legend>
+        <div class="grid">
+          <label>总工单<input name="slots" type="number" min="1" max="128" required></label>
+          <label>Codex 进程<input name="model_slots" type="number" min="1" max="128" required></label>
+          <label>Blender 进程<input name="render_slots" type="number" min="1" max="128" required></label>
+          <label>传输并发<input name="transfer_slots" type="number" min="1" max="128" required></label>
+          <label>单次渲染线程<input name="cpu_threads" type="number" min="1" max="128" required></label>
+          <label>预留磁盘 GiB<input name="disk_reserve_gib" type="number" min="1" max="128" required></label>
+          <label>设备<select name="render_backend"><option>auto</option><option>cpu</option><option>metal</option><option>cuda</option><option>optix</option><option>hip</option><option>oneapi</option></select></label>
+          <label>首制输出宽度<input name="final_width" type="number" min="2" max="3840" required></label>
+        </div>
+      </fieldset>
+      <details>
+        <summary>工具路径</summary>
+        <div class="grid">
+          <label>Codex CLI<input name="codex"></label>
+          <label>Blender<input name="blender"></label>
+          <label>FFmpeg<input name="ffmpeg"></label>
+          <label>FFprobe<input name="ffprobe"></label>
+        </div>
+      </details>
+      <details id="login">
+        <summary>登录启动</summary>
+        <p id="login-status">正在检查登录启动</p>
+        <div class="actions"><button type="button" id="login-toggle" disabled>启用登录启动</button></div>
+      </details>
+      <details>
+        <summary>Git 更新</summary>
+        <div class="grid">
+          <label>Git 仓库<input name="update_remote" placeholder="https://…"></label>
+          <label>发布标签<input name="update_tag"></label>
+          <label>可信公钥文件<input name="update_signers" placeholder="allowed_signers 的本机绝对路径"></label>
+          <label>检查间隔（分钟）<input name="update_interval_minutes" type="number" min="1" max="1440" required></label>
+          <label>自动检查开始时间<input name="update_window_start" type="time"></label>
+          <label>自动检查结束时间<input name="update_window_end" type="time"></label>
+        </div>
+        <label class="toggle"><input name="auto_update" type="checkbox">启用自动更新</label>
+        <p>时段按本机时间，留空可全天检查。安装时先等本机在途工单提交。</p>
+        <div class="actions">
+          <button type="button" data-control="update">检查并更新</button>
+          <button type="button" data-control="rollback">回退上个版本</button>
+        </div>
+        <p id="update-status"></p>
+      </details>
+      <footer><button type="submit" class="primary">保存配置</button></footer>
+    </section>
+  </form>
+  <output id="notice" aria-live="polite"></output>
 </main>
-<script src="/panel.js"></script></body></html>
+</body>
+</html>

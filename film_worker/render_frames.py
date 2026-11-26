@@ -1,5 +1,6 @@
 """Render one specified size from the immutable prepared Blender scene."""
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -9,7 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from engineering_checks import require_cycles
 
 
-def render(output, backend, width, height, threads, *, draft=False):
+def render(output, backend, width, height, threads, *, draft=False, cache_dir=None, numbers=None):
     scene = bpy.context.scene
     if draft:
         require_cycles(scene.render.engine)
@@ -24,6 +25,10 @@ def render(output, backend, width, height, threads, *, draft=False):
         if draft:
             scene.cycles.samples = 2
         if backend != "cpu":
+            if backend in {"optix", "cuda"}:
+                cache = (cache_dir or output.parent / ".gpu-cache") / backend
+                cache.mkdir(parents=True, exist_ok=True)
+                os.environ["OPTIX_CACHE_PATH" if backend == "optix" else "CUDA_CACHE_PATH"] = str(cache)
             preferences = bpy.context.preferences.addons["cycles"].preferences
             device_type = backend.upper()
             preferences.compute_device_type = device_type
@@ -41,7 +46,9 @@ def render(output, backend, width, height, threads, *, draft=False):
 
     output.mkdir(parents=True, exist_ok=True)
     temporary = output / "rendering.png"
-    for number in range(scene.frame_start, scene.frame_end + 1):
+    if numbers and any(not scene.frame_start <= n <= scene.frame_end for n in numbers):
+        raise ValueError("试渲帧号超出工程时间线")
+    for number in numbers or range(scene.frame_start, scene.frame_end + 1):
         target = output / f"{number:04d}.png"
         if target.exists():
             continue
@@ -60,5 +67,8 @@ parser.add_argument("width", type=int)
 parser.add_argument("height", type=int)
 parser.add_argument("threads", type=int)
 parser.add_argument("--draft", action="store_true")
+parser.add_argument("--cache-dir", type=Path)
+parser.add_argument("--frames", nargs="+", type=int)
 args = parser.parse_args(sys.argv[sys.argv.index("--") + 1:])
-render(args.output.resolve(), args.backend, args.width, args.height, args.threads, draft=args.draft)
+render(args.output.resolve(), args.backend, args.width, args.height, args.threads, draft=args.draft,
+       cache_dir=args.cache_dir, numbers=args.frames)

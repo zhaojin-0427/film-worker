@@ -6,10 +6,11 @@ import http.client
 import json
 import re
 import socket
+import ssl
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlsplit
-from urllib.request import HTTPRedirectHandler, Request, build_opener
+from urllib.request import HTTPRedirectHandler, HTTPSHandler, Request, build_opener
 
 
 REVIEW_STORAGE_HEADER = "X-Film-Worker-Review-Storage"
@@ -56,7 +57,7 @@ def key(*values):
 
 
 class Client:
-    def __init__(self, server, token, *, test_http=False):
+    def __init__(self, server, token, *, test_http=False, certificates=None):
         parsed = urlsplit(server)
         local = parsed.hostname in {"127.0.0.1", "::1", "localhost"}
         if (not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment
@@ -67,7 +68,15 @@ class Client:
         if not self.base.endswith("/api/v1"):
             self.base += "/api/v1"
         self.token = token
-        self.opener = build_opener(NoRedirects())
+        handlers = [NoRedirects()]
+        if parsed.scheme == "https" and certificates is not None:
+            host = quote(parsed.hostname, safe="")
+            ca_file = certificates / f"{host}-{parsed.port or 443}.pem"
+            if ca_file.is_file():
+                context = ssl.create_default_context()
+                context.load_verify_locations(cafile=str(ca_file))
+                handlers.append(HTTPSHandler(context=context))
+        self.opener = build_opener(*handlers)
 
     def open(self, method, path, *, body=None, headers=None, timeout=12):
         request_headers = {"Authorization": "Bearer " + self.token, **(headers or {})}

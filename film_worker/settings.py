@@ -19,6 +19,8 @@ ROOT = Path(__file__).resolve().parent.parent
 KINDS = ["prepare", "revise", "finalize"]
 UPDATE_REMOTE = "https://github.com/zgw494294-blip/film-worker.git"
 MODEL_FIELDS = ("codex_model", "codex_provider", "reasoning_effort")
+REVIEW_JPEG = {"fine": (94, 0), "standard": (85, 2), "economy": (78, 2)}
+REVIEW_FIELDS = ("review_clarity", "dual_role_review")
 
 DEFAULTS = {
     "server": "",
@@ -30,6 +32,9 @@ DEFAULTS = {
     "transfer_slots": 1,
     "cpu_threads": 4,
     "disk_reserve_gib": 8,
+    "final_width": 1920,
+    "review_clarity": "standard",
+    "dual_role_review": True,
     "codex": "",
     "blender": "",
     "ffmpeg": "",
@@ -93,9 +98,17 @@ def validate_config(settings):
     model = legacy[0] if isinstance(legacy, list) and legacy and isinstance(legacy[0], dict) else {}
     config = {**DEFAULTS, **{k: model[k] for k in MODEL_FIELDS if k in model},
               **{k: v for k,v in settings.items() if k in DEFAULTS}}
+    if "final_width" in model and "final_width" not in settings:
+        config["final_width"] = model["final_width"]
     for field in ("slots", "model_slots", "render_slots", "transfer_slots", "cpu_threads", "disk_reserve_gib"):
         if type(config[field]) is not int or not 1 <= config[field] <= 128:
             raise ValueError(f"{field} 须为 1–128 的整数")
+    if type(config["final_width"]) is not int or not 2 <= config["final_width"] <= 3840:
+        raise ValueError("final_width 须为 2–3840 的整数")
+    if not isinstance(config["review_clarity"], str) or config["review_clarity"] not in REVIEW_JPEG:
+        raise ValueError("未知审片清晰度")
+    if type(config["dual_role_review"]) is not bool:
+        raise ValueError("双角色自动送审设置无效")
     interval = config["update_interval_minutes"]
     if type(interval) is not int or not 1 <= interval <= 1440 or type(config["auto_update"]) is not bool:
         raise ValueError("更新周期须为 1–1440 分钟")
@@ -212,13 +225,42 @@ def local_build():
     return active if active and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", active) else None
 
 
-def inspect_tools(tools):
+def probe_render_backend(blender, backend):
+    if backend in {"auto", "cpu"}:
+        return
+    device_type = backend.upper()
+    script = (
+        "import bpy; "
+        "preferences=bpy.context.preferences.addons['cycles'].preferences; "
+        "preferences.get_devices(); "
+        f"devices=list(preferences.get_devices_for_type({device_type!r}) or []); "
+        f"gpu=[device.name for device in devices if device.type == {device_type!r}]; "
+        "print('FILM_WORKER_GPU=' + '|'.join(gpu)); "
+        "raise SystemExit(0 if gpu else 17)"
+    )
+    try:
+        result = subprocess.run(
+            [blender, "-b", "--factory-startup", "--python-expr", script, "--python-exit-code", "1"],
+            capture_output=True, text=True, errors="replace", timeout=45,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except subprocess.SubprocessError as exc:
+        raise ValueError(f"Blender {device_type} GPU 探测失败") from exc
+    output = result.stdout + result.stderr
+    match = re.search(r"FILM_WORKER_GPU=([^\r\n]*)", output)
+    if result.returncode or not match or not match.group(1).strip():
+        detail = match.group(1).strip() if match else "未返回设备名称"
+        raise ValueError(f"Blender 未找到可用的 {device_type} GPU（{detail}）")
+
+
+def inspect_tools(tools, render_backend="cpu"):
     ffmpeg = version(tools["ffmpeg"], r"ffmpeg version ([^\s]+)", "-version")
     probe = version(tools["ffprobe"], r"ffprobe version ([^\s]+)", "-version")
     build = version(tools["blender"], r"Blender ([^\s]+)")
     cli = version(tools["codex"], r"codex-cli ([^\s]+)")
     if probe != ffmpeg:
         raise ValueError("FFmpeg 和 FFprobe 版本必须一致")
+    probe_render_backend(tools["blender"], render_backend)
     result = {"blender": build, "ffmpeg": ffmpeg, "codex_cli": cli,
               "decoder_id": f"rgb8-pillow{PIL.__version__}-av{av.__version__}/1"}
     if commit := local_build():
@@ -241,7 +283,7 @@ def environment(config, versions, profile=None, evidence="configured", actual_ba
 def production_settings(config, versions, order):
     legacy = order.get("profile") or {}
     result = {k: config.get(k, "") for k in MODEL_FIELDS}
-    result.update(final_width=legacy.get("final_width", 3840),
+    result.update(final_width=legacy.get("final_width", config["final_width"]),
                   review_landscape_limit=legacy.get("review_landscape_limit", {"width": 1920, "height": 1080}),
                   review_portrait_limit=legacy.get("review_portrait_limit", {"width": 1080, "height": 1920}),
                   compatibility=dict(versions),

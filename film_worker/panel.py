@@ -8,13 +8,15 @@ import webbrowser
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 from . import model, startup
+from .model_recovery import location as recovery_location, write_state as write_recovery_state
+from .progress import panel_details
 from .releases import RESTART_FOR_UPDATE, Releases
 from .scheduler import Scheduler
 from .secrets import read_token, store_token
-from .settings import atomic_json, inspect_tools, load, resolve_tools, validate_config
+from .settings import REVIEW_FIELDS, atomic_json, inspect_tools, load, resolve_tools, validate_config
 
 
 WEB = Path(__file__).with_name("web")
@@ -141,6 +143,22 @@ class Handler(BaseHTTPRequestHandler):
     def permitted(self):
         return self.headers.get("Host") == self.server.origin.removeprefix("http://")
 
+    def local_reviews(self):
+        scheduler = self.server.scheduler
+        if not scheduler:
+            return
+        with scheduler.lock:
+            active = list(scheduler.active.values())
+        for current in active:
+            directory = current["directory"]
+            if scheduler.current(directory, current["progress"])["stage"] != "awaiting_local_review":
+                continue
+            try:
+                data = json.loads((directory / "local-review.json").read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            yield directory, data
+
     def do_GET(self):
         if not self.permitted():
             return self.reply(403, {"error": "请求来源无效"})
@@ -154,6 +172,19 @@ class Handler(BaseHTTPRequestHandler):
                 return self.reply(400, {"error":str(exc)})
         if path == "/api/status":
             return self.reply(200, self.server.summary())
+        if path == "/api/local-review":
+            return self.reply(200, {"reviews": [data for _, data in self.local_reviews()]})
+        if path == "/api/local-review/sample":
+            query = parse_qs(urlsplit(self.path).query)
+            for directory, data in self.local_reviews():
+                if query.get("work") != [data["work_id"]] or query.get("attempt") != [str(data["attempt"])]:
+                    continue
+                for raw in data["samples"]:
+                    sample = Path(raw).resolve()
+                    if (sample.parent == (directory / "local-review").resolve()
+                            and query.get("frame") == [sample.name] and sample.is_file()):
+                        return self.reply(200, sample.read_bytes(), "image/jpeg")
+            return self.reply(404, {"error": "找不到复核样张"})
         if path == "/api/config":
             return self.reply(200, {"config": load(self.server.config), "csrf": self.server.csrf})
         assets = {"/": ("index.html", "text/html"), "/panel.css": ("panel.css", "text/css"),
@@ -185,17 +216,55 @@ class Handler(BaseHTTPRequestHandler):
                 config = load(node.config)
                 answer = model.test(resolve_tools(config)["codex"], config)
                 return self.reply(200,answer)
+            if self.path == "/api/codex-reconnect":
+                scheduler = node.scheduler
+                if not scheduler or not node.runner or not node.runner.is_alive():
+                    raise ValueError("节点未运行")
+                if not isinstance(payload.get("work_id"), str) or type(payload.get("attempt")) is not int:
+                    raise ValueError("工单身份无效")
+                with scheduler.lock:
+                    active = scheduler.active.get((payload["work_id"], payload["attempt"]))
+                    if not active or active["stop"].is_set():
+                        raise ValueError("工单已停止或租约已失效")
+                    directory = active["directory"]
+                    progress = scheduler.current(directory, active["progress"])
+                    recovery = panel_details(directory, progress, active["kind"]).get("recovery", {})
+                    wait_id = recovery.get("wait_id")
+                    if not wait_id or wait_id != payload.get("wait_id"):
+                        raise ValueError("当前恢复状态已变化")
+                    write_recovery_state(recovery_location(directory) / "retry.json", {"wait_id": wait_id})
+                return self.reply(200, {"saved": True})
+            if self.path == "/api/local-review":
+                if payload.get("decision") not in {"approve", "reject"} or not payload.get("work_id"):
+                    raise ValueError("本地复核需要 work_id 和 approve/reject 决定")
+                for _, data in self.local_reviews():
+                    fields = ("work_id", "attempt", "outputs_sha256")
+                    if all(payload.get(key) == data[key] for key in fields):
+                        approval = node.scheduler.local_approval_path(data["work_id"], data["attempt"])
+                        atomic_json(approval,
+                                    {**{key: data[key] for key in (*fields, "job_id")},
+                                     "decision": payload["decision"]})
+                        return self.reply(200, {"saved": True, "decision": payload["decision"]})
+                raise ValueError("复核版本已变化，请重新打开样张")
             with node.lock:
                 if self.path == "/api/config":
-                    if node.runner and node.runner.is_alive():
-                        raise ValueError("请先暂停领单，等待在途工单完成，再停止节点并保存")
                     config = validate_config(payload["config"])
+                    if node.runner and node.runner.is_alive():
+                        prior = load(node.config)
+                        changing_other = any(config[key] != prior[key] for key in config if key not in REVIEW_FIELDS)
+                        if changing_other or payload.get("token"):
+                            raise ValueError("运行中可以保存审片设置。其他设置需等待在途工单完成并停止节点")
+                        with node.scheduler.lock:
+                            atomic_json(node.config, config)
+                            node.scheduler.cfg.update({key: config[key] for key in REVIEW_FIELDS})
+                        return self.reply(200, {"saved": True})
                     if payload.get("token"):
                         store_token(node.root, payload["token"])
                     atomic_json(node.config, config)
                     return self.reply(200, {"saved": True})
                 if self.path == "/api/probe":
-                    versions = inspect_tools(resolve_tools(load(node.config)))
+                    config = load(node.config)
+                    versions = inspect_tools(resolve_tools(config), config["render_backend"])
                     return self.reply(200, {"versions": versions})
                 if self.path in ("/api/update", "/api/rollback"):
                     node.update(rollback=self.path == "/api/rollback")
@@ -208,8 +277,10 @@ class Handler(BaseHTTPRequestHandler):
                     if node.scheduler and node.runner.is_alive():
                         if self.path == "/api/drain":
                             node.scheduler.drain.set()
+                            node.scheduler.state.set("claims_paused", True)
                         elif self.path == "/api/resume":
                             node.scheduler.drain.clear()
+                            node.scheduler.state.set("claims_paused", False)
                         else:
                             if node.scheduler.summary()["active"] or not node.scheduler.drain.is_set():
                                 raise ValueError("请先暂停领单并等待在途工单完成")

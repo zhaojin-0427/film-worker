@@ -2,6 +2,8 @@
 import os
 import signal
 import subprocess
+import time
+from pathlib import PureWindowsPath
 
 
 def resume_windows_process(pid):
@@ -49,7 +51,7 @@ def resume_windows_process(pid):
 
 
 class ProcessTree:
-    def __init__(self, command, *, cwd, env, log):
+    def __init__(self, command, *, cwd, env, log, stdin=None):
         self.job = None
         creation_flags = 0
         if os.name == "nt":
@@ -59,7 +61,7 @@ class ProcessTree:
 
             # Windows venv launchers can start their interpreter before Python code reads stdin.
             creation_flags = subprocess.CREATE_NO_WINDOW | win32con.CREATE_SUSPENDED
-        self.child = subprocess.Popen(command, cwd=cwd, env=env, stdin=subprocess.PIPE, stdout=log,
+        self.child = subprocess.Popen(command, cwd=cwd, env=env, stdin=subprocess.PIPE if stdin is None else stdin, stdout=log,
                                       stderr=subprocess.STDOUT, start_new_session=os.name != "nt",
                                       creationflags=creation_flags)
         try:
@@ -76,25 +78,62 @@ class ProcessTree:
                     process.Close()
                 resume_windows_process(self.child.pid)
             # The child waits for this byte before starting any subprocess.
-            self.child.stdin.write(b"1")
-            self.child.stdin.flush()
+            if stdin is None:
+                self.child.stdin.write(b"1")
+                self.child.stdin.flush()
         except BaseException:
             try:
                 self.child.kill()
                 self.child.wait()
             finally:
-                self.child.stdin.close()
+                if self.child.stdin is not None:
+                    self.child.stdin.close()
                 if self.job is not None:
                     self.job.Close()
             raise
 
-    def close(self):
-        self.child.stdin.close()
+    def has_children(self):
+        if self.job is None:
+            return False
+        import pywintypes
+        import win32api
+        import win32con
+        import win32job
+        import win32process
+
+        for pid in win32job.QueryInformationJobObject(self.job, win32job.JobObjectBasicProcessIdList):
+            if pid == self.child.pid:
+                continue
+            try:
+                handle = win32api.OpenProcess(win32con.PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+                try:
+                    image = win32process.GetModuleFileNameEx(handle, 0)
+                finally:
+                    handle.Close()
+            except pywintypes.error as exc:
+                if exc.winerror == 87:
+                    continue
+                return True
+            if PureWindowsPath(image).name.lower() != "conhost.exe":
+                return True
+        return False
+
+    def close(self, *, wait_for_children=False):
+        if self.child.stdin is not None:
+            self.child.stdin.close()
         if self.job is not None:
             import win32job
 
             try:
                 win32job.TerminateJobObject(self.job, 1)
+                if wait_for_children:
+                    deadline = time.monotonic() + 10
+                    while win32job.QueryInformationJobObject(
+                        self.job, win32job.JobObjectBasicAccountingInformation,
+                    )["ActiveProcesses"]:
+                        if time.monotonic() >= deadline:
+                            raise TimeoutError("旧 Codex 或工具进程仍未退出")
+                        time.sleep(0.05)
             finally:
                 self.job.Close()
         else:

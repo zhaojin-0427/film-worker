@@ -5,12 +5,25 @@ import re
 import subprocess
 import tempfile
 
-def options(binary, config, directory, *, sandbox, blender_config=None):
-    command = [binary, "exec", "--skip-git-repo-check", "--sandbox", sandbox,
+def command_environment(environment):
+    env = dict(environment)
+    env.pop("FILM_WORKER_TOKEN", None)
+    if os.name == "nt":
+        for name in ("CODEX_APP_RUNTIME_CLI_PATH", "CODEX_APP_TOOLS_PIPE_PATH",
+                     "CODEX_WINDOWS_REGISTERED_CORE", "CODEX_WINDOWS_SANDBOX_PACKAGE_FAMILY"):
+            env.pop(name, None)
+    return env
+
+
+def options(binary, config, directory, *, sandbox, job_root=None, blender_config=None):
+    command = [binary, "exec", "--skip-git-repo-check",
                "-c", 'approval_policy="never"', "-c", "project_doc_max_bytes=0",
-               "-c", 'web_search="disabled"', "-c", "sandbox_workspace_write.network_access=false",
-               "--disable", "hooks", "--disable", "memories", "--disable", "plugins",
-               "--color", "never", "-C", str(directory)]
+               "-c", 'web_search="disabled"',
+               "--disable", "hooks", "--disable", "memories", "--disable", "plugins"]
+    command += ["--sandbox", sandbox, "-c", "sandbox_workspace_write.network_access=false"]
+    if job_root is not None:
+        command += ["--add-dir", str(job_root)]
+    command += ["--color", "never", "-C", str(directory)]
     if config.get("codex_model"):
         command += ["-m", config["codex_model"]]
     for field, key in (("reasoning_effort", "model_reasoning_effort"), ("codex_provider", "model_provider")):
@@ -33,7 +46,7 @@ def evidence(header):
 def test(binary, profile):
     with tempfile.TemporaryDirectory(prefix="film-model-test-") as directory:
         command = [*options(binary, profile, directory, sandbox="read-only"), "只回答 FILM_WORKER_OK"]
-        env = {key: value for key, value in os.environ.items() if key != "FILM_WORKER_TOKEN"}
+        env = command_environment(os.environ)
         try:
             output = subprocess.run(command, cwd=directory, check=True, timeout=100, capture_output=True,
                                     encoding="utf-8", errors="replace", env=env)

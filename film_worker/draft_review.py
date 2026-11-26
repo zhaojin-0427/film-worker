@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from film_worker.actor_guard import ACTOR_GEOMETRY
 from film_worker.media import (add_audio, comparison, encode_images, even, frame_path, intake,
                                read_json, rgb, validate_encoded, write_json)
+from film_worker.progress import Progress
 
 BASE = Path(__file__).resolve().parent
 
@@ -32,7 +33,7 @@ def current(stage):
     return recorded == {"version": REVIEW_VERSION, "scene": intake.digest(scene), "movie": intake.digest(movie)}
 
 
-def generate(stage, source, blender, threads):
+def generate(stage, source, blender, threads, backend="cpu", *, progress=None):
     if current(stage):
         return stage / MOVIE
     scene = stage / "scene.blend"
@@ -56,8 +57,25 @@ def generate(stage, source, blender, threads):
         subprocess.run([*command, str(BASE / "prepare_render.py")],
                        env=dict(os.environ, MOVIE_JOB_TIMELINE=str(timeline_path), MOVIE_BUILTIN_RULES="1",
                                 MOVIE_ACTOR_GEOMETRY=str(stage / ACTOR_GEOMETRY)), check=True)
-        subprocess.run([*command, str(BASE / "render_frames.py"), "--", str(frames), "cpu",
-                        str(width), str(height), str(threads), "--draft"], check=True)
+        render = [*command, str(BASE / "render_frames.py"), "--", str(frames), backend,
+                  str(width), str(height), str(threads), "--draft",
+                  "--cache-dir", str(stage.parent / ".gpu-cache")]
+        if progress is None:
+            subprocess.run(render, check=True)
+        else:
+            count = len(timeline["pts"])
+            render_stage = "render_draft_" + backend
+            progress(render_stage, 0, count, render_size=(width, height))
+            with subprocess.Popen(render) as child:
+                while True:
+                    try:
+                        child.wait(timeout=2)
+                        break
+                    except subprocess.TimeoutExpired:
+                        progress(render_stage, sum(1 for path in frames.glob("*.png") if path.stem.isdecimal()), count)
+                if child.returncode:
+                    raise subprocess.CalledProcessError(child.returncode, render)
+            progress("encode_draft")
         silent, encoded = folder / "silent.mp4", folder / MOVIE
 
         def pair(number):
@@ -65,6 +83,8 @@ def generate(stage, source, blender, threads):
 
         encode_images(silent, timeline, pair_size, pair, preview=True)
         add_audio(silent, encoded, timeline, source)
+        if progress is not None:
+            progress("verify_draft")
         validate_encoded(encoded, timeline, pair_size, preview=True)
         if intake.digest(scene) != scene_hash:
             raise ValueError("生成自检片时工程发生变化，请再次生成")
@@ -80,10 +100,14 @@ if __name__ == "__main__":
     parser.add_argument("source", type=Path)
     parser.add_argument("blender")
     parser.add_argument("threads", type=int)
+    parser.add_argument("--backend", default="cpu", choices=("cpu", "metal", "cuda", "optix", "hip", "oneapi"))
     parser.add_argument("--ffmpeg")
     parser.add_argument("--ffprobe")
+    parser.add_argument("--report-progress", action="store_true")
     args = parser.parse_args()
     for name in ("ffmpeg", "ffprobe"):
         if executable := getattr(args, name):
             os.environ["FILM_WORKER_" + name.upper()] = executable
-    print(generate(args.stage.resolve(), args.source.resolve(), args.blender, args.threads))
+    stage = args.stage.resolve()
+    progress = Progress(stage.parent) if args.report_progress else None
+    print(generate(stage, args.source.resolve(), args.blender, args.threads, args.backend, progress=progress))

@@ -9,14 +9,17 @@ import sys
 import threading
 import time
 import uuid
+import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 
 from . import bundles
+from .model_recovery import ResumeLease, location as recovery_location
+from .progress import Progress, panel_details
 from .processes import ProcessTree
 from .protocol import (LOCAL_REVIEW_MODE, REVIEW_STORAGE_HEADER, Client, Interrupted, ProtocolError,
                        Transfer, digest, key, opaque, valid_digest)
-from .settings import (KINDS, ROOT, atomic_json, environment, inspect_tools, object_hash,
+from .settings import (KINDS, REVIEW_FIELDS, ROOT, atomic_json, environment, inspect_tools, object_hash,
                        production_settings, registration, resolve_tools, validate_config)
 from .state import State, identity, slot
 
@@ -71,12 +74,14 @@ class LeaseWatch:
         raise Interrupted
 
     def watch(self):
+        resume = getattr(self.transfer, "resume_lease", None)
         while not self.closed.is_set() and not self.stop.is_set():
             before = time.monotonic()
             if before >= self.deadline:
                 break
             try:
                 status = self.progress()
+                ticket = resume.pending() if resume is not None else None
                 response, _ = self.transfer.api.json("POST", f"/work/{self.transfer.work}/heartbeat",
                                                      body=status, headers=self.transfer.headers,
                                                      timeout=max(0.2, min(7, self.deadline - before)))
@@ -90,9 +95,16 @@ class LeaseWatch:
                 if self.deadline <= time.monotonic():
                     self.directive = "lease_expired"
                     break
+                if ticket and not self.stop.is_set():
+                    resume.grant(ticket, self.deadline)
                 self.confirmed.set()
                 self.events.send(status)
-                self.closed.wait(max(0, min(self.seconds, self.deadline - time.monotonic())))
+                next_pulse = min(time.monotonic() + self.seconds, self.deadline)
+                while not self.stop.is_set() and time.monotonic() < next_pulse:
+                    if self.closed.wait(min(1.0, max(0, next_pulse - time.monotonic()))):
+                        break
+                    if resume is not None and resume.pending():
+                        break
             except ProtocolError as exc:
                 if not exc.retryable or exc.status in {401, 403, 409}:
                     self.directive = exc.code
@@ -137,13 +149,15 @@ class Scheduler:
         self.cfg = config
         self.root = root
         self.state = State(root)
-        self.api = Client(config["server"], token, test_http=test_http)
+        self.api = Client(config["server"], token, test_http=test_http, certificates=root / "certificates")
         self.tools = resolve_tools(config)
-        self.versions = inspect_tools(self.tools)
+        self.versions = inspect_tools(self.tools, config["render_backend"])
         self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=config["slots"])
         self.active = {}
         self.stop = threading.Event()
         self.drain = threading.Event()
+        if self.state.setting("claims_paused") is True:
+            self.drain.set()
         self.stop_after_drain = threading.Event()
         self.lock = threading.Lock()
         self.staleness = {}
@@ -159,11 +173,16 @@ class Scheduler:
 
     def summary(self):
         with self.lock:
-            attempts = [dict(work_id=w, attempt=n, **self.current(a["directory"], a["progress"]))
-                        for (w,n), a in self.active.items()]
-            state = {**self.status, "active": attempts, "draining": self.drain.is_set(),
+            active = list(self.active.items())
+            state = {**self.status, "draining": self.drain.is_set(),
                      "slots": self.cfg["slots"], "free_gib": shutil.disk_usage(self.root).free // 1024**3,
                      "versions": self.versions}
+        attempts = []
+        for (work, number), attempt in active:
+            directory, kind = attempt["directory"], attempt["kind"]
+            progress = self.current(directory, attempt["progress"])
+            attempts.append(dict(work_id=work, attempt=number, job_id=attempt["job_id"], kind=kind,
+                                 **progress, details=panel_details(directory, progress, kind)))
         history = []
         for row in self.state.rows(limit=18):
             assignment = json.loads(row["assignment"])
@@ -171,7 +190,7 @@ class Scheduler:
             history.append(dict(job_id=assignment["job_id"], work_id=row["work"], attempt=row["number"],
                                 kind=assignment["kind"], status=row["status"], message=row["message"],
                                 job_state=status.get("job_state"), delivery_versions=status.get("delivery_versions", [])))
-        return {**state, "history": history}
+        return {**state, "active": attempts, "history": history}
 
     @staticmethod
     def current(directory, fallback):
@@ -330,10 +349,18 @@ class Scheduler:
         folder = self.root / "work" / opaque(assignment["work_id"]) / str(assignment["lease"]["attempt"])
         folder.mkdir(parents=True, exist_ok=True)
         current = {"directory": folder, "stop": threading.Event(),
+                   "job_id": assignment["job_id"], "kind": assignment["kind"],
                    "progress": dict(stage="received", completed=0, total=None)}
         with self.lock:
             if any(work == ident[0] for work, _ in self.active) or len(self.active) >= self.cfg["slots"]:
                 return False
+            options = folder / "review-settings.json"
+            if not options.is_file():
+                prior = folder / "request.json"
+                saved = read(prior).get("review_settings", {}) if prior.is_file() else {
+                    key: self.cfg[key] for key in REVIEW_FIELDS
+                }
+                atomic_json(options, saved)
             self.active[ident] = current
         heartbeat_seconds = self.session["lease_heartbeat_seconds"]
         self.pool.submit(self.execute, assignment, deadline, heartbeat_seconds, current, pending)
@@ -444,6 +471,7 @@ class Scheduler:
     def execute_attempt(self, assignment, deadline, heartbeat_seconds, current, pending):
         directory = current["directory"]
         transfer = Transfer(self.api, assignment, current["stop"], self.root / "cache/sha256")
+        transfer.resume_lease = ResumeLease(recovery_location(directory), uuid.uuid4().hex)
         progress = lambda: self.current(directory, current["progress"])
         events = Events(self.state, assignment, transfer)
         watch = LeaseWatch(transfer, heartbeat_seconds, deadline, progress, events)
@@ -451,8 +479,7 @@ class Scheduler:
             with watch:
                 watch.wait_for_confirmation()
                 try:
-                    def report(stage):
-                        atomic_json(directory / "progress.json", dict(stage=stage, completed=0, total=None))
+                    report = Progress(directory)
                     if pending is None:
                         profile, artifacts = self.check_assignment(assignment)
                         checkpoint = self.load_checkpoint(assignment, directory, transfer.stop)
@@ -472,6 +499,7 @@ class Scheduler:
                         else:
                             report("reuse_outputs")
                             pending = self.upload_result(assignment, profile, checkpoint, directory, transfer)
+                    report("commit_result")
                     events.send(dict(stage="commit_result", completed=0, total=None))
                     receipt = transfer.json("POST", f"/work/{transfer.work}/complete", pending, "complete")
                     self.state.mark(assignment, status="succeeded", receipt=receipt)
@@ -505,7 +533,9 @@ class Scheduler:
                            environment=environment(self.cfg, self.versions, profile),
                            production=profile,
                            resources=str(self.root / "resources"), cpu_threads=self.cfg["cpu_threads"],
-                           model_slots=self.cfg["model_slots"], render_slots=self.cfg["render_slots"])
+                           model_slots=self.cfg["model_slots"], render_slots=self.cfg["render_slots"],
+                           review_settings=self.review_settings(directory),
+                           codex_lease_owner=transfer.resume_lease.owner)
             atomic_json(directory / "request.json", request)
             env = {name: value for name, value in os.environ.items() if name != "FILM_WORKER_TOKEN"}
             env["PYTHONUTF8"] = "1"
@@ -521,7 +551,7 @@ class Scheduler:
             if tree.child.returncode or not result_file.is_file():
                 error_file = directory / "error.json"
                 error = read(error_file) if error_file.is_file() else dict(code="render_failed", message="制作进程中止")
-                raise WorkFailure(dict(error, retryable=error["code"] not in {"input_invalid", "profile_mismatch"}))
+                raise WorkFailure({"retryable": error["code"] not in {"input_invalid", "profile_mismatch"}, **error})
         result = read(result_file)
         if set(result["outputs"]) != output_roles(assignment):
             raise ValueError("产物角色与工单类型不符")
@@ -538,6 +568,82 @@ class Scheduler:
                           input_manifest_sha256=assignment["input_manifest_sha256"], versions=self.versions)
         atomic_json(directory.parent / "outputs.json", checkpoint)
         return self.upload_result(assignment, profile, checkpoint, directory, transfer)
+
+    def local_approval_path(self, work, attempt):
+        return self.root / "local-approvals" / opaque(work) / f"{attempt}.json"
+
+    @staticmethod
+    def review_settings(directory):
+        path = directory / "review-settings.json"
+        return read(path) if path.is_file() else {}
+
+    def await_local_review(self, assignment, checkpoint, directory, transfer):
+        report = Progress(directory)
+        report("prepare_local_review")
+        review = directory / "local-review.json"
+        approval = self.local_approval_path(assignment["work_id"], assignment["lease"]["attempt"])
+        expected = dict(job_id=assignment["job_id"], work_id=assignment["work_id"],
+                        attempt=assignment["lease"]["attempt"],
+                        outputs_sha256={role: item["sha256"] for role, item in checkpoint["outputs"].items()})
+        try:
+            existing = read(review) if review.is_file() else {}
+        except (OSError, ValueError):
+            existing = {}
+        if not isinstance(existing, dict) or any(existing.get(k) != v for k, v in expected.items()):
+            sample_root = directory / "local-review"
+            sample_root.mkdir(parents=True, exist_ok=True)
+            samples = []
+            attempt = checkpoint["attempt"]
+            outputs = checkpoint["outputs"]
+            if "review_bundle" in outputs:
+                bundle = self.checkpoint_path(directory, attempt, outputs["review_bundle"])
+                with zipfile.ZipFile(bundle) as archive:
+                    pairs = sorted((name for name in archive.namelist()
+                                    if name.startswith("pairs/") and name.endswith(".jpg")
+                                    and Path(name).stem.isdecimal()),
+                                   key=lambda name: int(Path(name).stem))
+                    if not pairs:
+                        raise ValueError("审核包没有逐帧对比图")
+                    for name in dict.fromkeys((pairs[0], pairs[len(pairs) // 2], pairs[-1])):
+                        target = sample_root / Path(name).name
+                        target.write_bytes(archive.read(name))
+                        samples.append(str(target))
+            else:
+                import av
+
+                video = self.checkpoint_path(directory, attempt, outputs["comparison_video"])
+                count = checkpoint["final_verification"]["comparison_frame_count"]
+                wanted = {1, count // 2 + 1, count}
+                with av.open(str(video)) as container:
+                    for number, frame in enumerate(container.decode(video=0), 1):
+                        if transfer.stop.is_set():
+                            raise Interrupted
+                        if number in wanted:
+                            target = sample_root / f"{number:04d}.jpg"
+                            image = frame.to_image()
+                            image.thumbnail((1920, 2160))
+                            image.save(target, quality=94)
+                            samples.append(str(target))
+                        if number >= count:
+                            break
+                if len(samples) != len(wanted):
+                    raise ValueError("成片对比图抽帧不完整")
+            atomic_json(review, dict(schema_version=1, **expected, samples=samples, status="pending"))
+        report("awaiting_local_review")
+        while not transfer.stop.is_set():
+            try:
+                decision = read(approval) if approval.is_file() else {}
+            except (OSError, ValueError, TypeError):
+                decision = {}
+            if isinstance(decision, dict) and all(decision.get(k) == v for k, v in expected.items()):
+                if decision.get("decision") == "approve":
+                    return
+                if decision.get("decision") == "reject":
+                    raise WorkFailure({"code": "local_review_rejected", "message": "本地复核未通过，未上传产物",
+                                       "retryable": True})
+            if transfer.stop.wait(1):
+                raise Interrupted
+        raise Interrupted
 
     def load_checkpoint(self, assignment, directory, stopped):
         try:
@@ -567,6 +673,23 @@ class Scheduler:
         return path
 
     def upload_result(self, assignment, profile, result, directory, transfer):
+        automatic = self.review_settings(directory).get("dual_role_review", False)
+        if not automatic or profile.get("production_policy") == "human_required":
+            self.await_local_review(assignment, result, directory, transfer)
+        else:
+            approved = result.get("automatic_review")
+            expected = {role: item["sha256"] for role, item in result["outputs"].items()}
+            if assignment["kind"] == "finalize":
+                verification = result.get("final_verification", {})
+                if not all(verification.get(key) is True for key in ("pts_verified", "audio_verified")):
+                    raise WorkFailure(dict(code="integrity_failed", message="成片缺少技术校验结论", retryable=False))
+                scene_sha = verification.get("scene_sha256")
+            else:
+                version = self.checkpoint_path(directory, result["attempt"], result["outputs"]["version_manifest"])
+                scene_sha = read(version)["scene_sha256"]
+            if (not isinstance(approved, dict) or approved.get("outputs_sha256") != expected
+                    or not approved.get("inspected") or not scene_sha or approved.get("scene_sha256") != scene_sha):
+                raise WorkFailure(dict(code="integrity_failed", message="送审产物与独立审核结论不匹配", retryable=False))
         outputs = []
         if "review_storage" in assignment["input_manifest"] and "version_manifest" in result["outputs"]:
             manifest = result["outputs"]["version_manifest"]
@@ -575,11 +698,15 @@ class Scheduler:
                 raise WorkFailure(dict(code="input_invalid", message="本机送审版的无损帧或工程缺失，已停止送审", retryable=False))
             atomic_json(self.root / "local-reviews" / opaque(assignment["job_id"]) / (manifest["sha256"] + ".json"),
                         dict(work_id=transfer.work, attempt=result["attempt"]))
+        report = Progress(directory)
+        report("waiting_for_upload")
         with slot(self.root / "resources", "transfer", self.cfg["transfer_slots"], transfer.stop):
             for role, artifact in result["outputs"].items():
                 path = self.checkpoint_path(directory, result["attempt"], artifact)
+                stage = "upload_" + role
+                report(stage, 0, artifact["size"])
                 def update(done, total):
-                    atomic_json(directory / "progress.json", dict(stage="upload_" + role, completed=done, total=total))
+                    report(stage, done, total)
                 outputs.append(transfer.upload(role, path, ROLE_TYPES[role], update, expected_sha=artifact["sha256"]))
         payload = dict(input_manifest_sha256=assignment["input_manifest_sha256"],
                        environment=result["environment"], outputs=outputs)

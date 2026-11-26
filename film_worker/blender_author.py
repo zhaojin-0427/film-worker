@@ -31,6 +31,25 @@ def background_environment(binary):
         yield dict(os.environ, BLENDER_USER_CONFIG=config)
 
 
+def run_windows(binary, arguments):
+    """Run Blender without a console while preserving its diagnostics."""
+    no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    with tempfile.NamedTemporaryFile(prefix="film-blender-", suffix=".log", delete=False) as capture:
+        capture_path = Path(capture.name)
+    try:
+        with capture_path.open("wb") as output:
+            result = subprocess.run([binary, *arguments], stdout=output, stderr=subprocess.STDOUT,
+                                    creationflags=no_window)
+        stream = getattr(sys.stdout, "buffer", None)
+        if stream is not None:
+            with capture_path.open("rb") as output:
+                shutil.copyfileobj(output, stream)
+            stream.flush()
+        return result.returncode
+    finally:
+        capture_path.unlink(missing_ok=True)
+
+
 def main(binary, arguments):
     options = arguments[:arguments.index("--")] if "--" in arguments else arguments
     if "-b" not in options and "--background" not in options:
@@ -48,7 +67,7 @@ def main(binary, arguments):
                                        timeout=10, creationflags=no_window).stdout
             if b"--console-crash-handler" in help_text:
                 arguments = ["--console-crash-handler", *arguments]
-        return subprocess.run([binary, *arguments], creationflags=no_window).returncode
+        return run_windows(binary, arguments)
     os.execv(binary, [binary, *arguments])
 
 
