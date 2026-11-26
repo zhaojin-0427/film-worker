@@ -20,7 +20,7 @@ from .engineering_checks import EngineeringValidationError
 from .progress import Progress
 from .production_helpers import check_rendered_frames, validate_meta, write_feedback
 from .production_palette import prompt_table
-from .protocol import digest
+from .protocol import REJECTED_FRAMES_MODE, digest
 from .settings import REVIEW_JPEG, atomic_json, object_hash
 from .processes import ProcessTree
 from .state import slot
@@ -66,6 +66,7 @@ class Production:
         self.order = request["assignment"]["input_manifest"]
         self.kind = self.order["kind"]
         self.review_storage = self.order.get("review_storage")
+        self.rejected_frames = None
         self.profile = request.get("production") or self.order.get("profile") or {}
         self.env = request["environment"].copy()
         self.tools = request["tools"]
@@ -200,11 +201,18 @@ class Production:
         review = bundles.extract(self.sources["review_bundle"], self.prior_review, indexed=True)
         self.scene_file = self.prior_scene / "scene.blend"
         if (digest(self.scene_file), scene["scene_sha256"], review["scene_sha256"],
-                digest(self.sources["scene_bundle"]), digest(self.sources["review_bundle"]),
-                digest(self.sources["shot_metadata"])) != (
+                digest(self.sources["scene_bundle"]), digest(self.sources["shot_metadata"])) != (
                 base["scene_sha256"], base["scene_sha256"], base["scene_sha256"], base["scene_bundle_sha256"],
-                base["review_bundle_sha256"], base["shot_metadata_sha256"]):
+                base["shot_metadata_sha256"]):
             raise ValueError("基版工程或审片文件已变更")
+        if "review_delta" in base:
+            delta = base["review_delta"]
+            # The uploaded delta and the materialized full ZIP have different bytes.
+            if (delta["mode"] != REJECTED_FRAMES_MODE or "review_delta" in review
+                    or self.review_files_hash(review["files"]) != delta["full_files_sha256"]):
+                raise ValueError("基版完整审核包与冻结的文件索引不符")
+        elif digest(self.sources["review_bundle"]) != base["review_bundle_sha256"]:
+            raise ValueError("基版审片包已变更")
         if any(review.get(k) != base.get(k) for k in (
                 "job_id", "source_sha256", "timeline_sha256", "review_size", "final_size", "frames", "review_storage")):
             raise ValueError("基版审核索引不匹配")
@@ -254,6 +262,8 @@ class Production:
             marked = self.verify_items(feedback["frames"])
             if not marked or marked.keys() & approved.keys() or any(feedback.get(k) != v for k,v in conditions.items()):
                 raise ValueError("返修单与基版或原标注员不一致")
+            if self.order.get("review_upload") == REJECTED_FRAMES_MODE:
+                self.rejected_frames = set(marked)
             # Feedback helper expects chronological JPEG names.
             images = self.root / "feedback-base/pairs"
             images.mkdir(parents=True, exist_ok=True)
@@ -325,6 +335,7 @@ class Production:
         (review_root / "pairs").mkdir(parents=True, exist_ok=True)
         (white_root / "white").mkdir(parents=True, exist_ok=True)
         frames = []
+        outside_feedback = []
         prior = {row["number"]: row for row in self.previous["frames"]} if self.previous else {}
         def save_pair(i, rendered):
             png = media.frame_path(rendered, i)
@@ -333,7 +344,13 @@ class Production:
             signature = media.signature(pair, self.timeline, i)
             jpg_name, png_name = f"pairs/{i:04d}.jpg", f"white/{i:04d}.png"
             target = review_root / jpg_name
-            if i in prior and prior[i]["review_signature"] == signature:
+            unchanged = i in prior and prior[i]["review_signature"] == signature
+            if self.rejected_frames is not None and i not in self.rejected_frames:
+                if unchanged:
+                    png = self.prior_white / bundles.safe_path(prior[i]["white_png_path"])
+                else:
+                    outside_feedback.append(i)
+            if unchanged:
                 shutil.copyfile(self.prior_review / bundles.safe_path(prior[i]["pair_jpeg_path"]), target)
             else:
                 if self.review_clarity:
@@ -365,6 +382,7 @@ class Production:
 
             try:
                 self.render(scene, self.review_size, "review", on_frames=on_frames)
+                self.verify_delta_scope(outside_feedback)
                 self.progress("codex_auditor")
                 approval = review.finish()
             finally:
@@ -376,6 +394,7 @@ class Production:
             for i in range(1, self.count + 1):
                 self.progress("compare_review", i, self.count)
                 save_pair(i, rendered)
+            self.verify_delta_scope(outside_feedback)
         common = dict(schema_version=1, job_id=self.order["job_id"], source_sha256=self.timeline["source_sha256"],
                       timeline_sha256=self.timeline_sha, scene_sha256=scene_sha,
                       review_size=dimensions(self.review_size), final_size=dimensions(self.final_size), frames=frames)
@@ -384,8 +403,29 @@ class Production:
         if self.review_storage:
             common["review_storage"] = self.review_storage
         self.progress("package_review")
+        index = dict(common, target_version=self.order["target_version"])
         review_bundle = self.output / "review.zip"
-        bundles.build(review_root, dict(common, target_version=self.order["target_version"]), review_bundle)
+        if self.rejected_frames is None:
+            bundles.build(review_root, index, review_bundle)
+        else:
+            full_files = bundles.entries(review_root)
+            expected_paths = {frame["pair_jpeg_path"] for frame in frames}
+            if not self.review_storage:
+                expected_paths.update(frame["white_png_path"] for frame in frames)
+            if {file["path"] for file in full_files} != expected_paths:
+                raise ValueError("审核包文件与全帧索引不一致")
+            delta = dict(mode=REJECTED_FRAMES_MODE, base_version=self.previous["version"],
+                         base_manifest_sha256=digest(self.sources["version_manifest"]),
+                         frames=sorted(self.rejected_frames), full_files_sha256=self.review_files_hash(full_files))
+            changed_paths = {f"pairs/{n:04d}.jpg" for n in self.rejected_frames}
+            if not self.review_storage:
+                changed_paths.update(f"white/{n:04d}.png" for n in self.rejected_frames)
+            delta_files = [file for file in full_files if file["path"] in changed_paths]
+            if self.review_storage:
+                bundles.build(review_root, index, review_bundle, content=full_files)
+            review_bundle = self.output / "review-delta.zip"
+            bundles.build(review_root, dict(index, review_delta=delta), review_bundle, content=delta_files)
+            common["review_delta"] = delta
         report = self.output / "production.json"
         records = self.stage / "制作记录.md"
         details = records.read_text(encoding="utf-8")[:30000] if records.is_file() else ""
@@ -407,6 +447,19 @@ class Production:
         if approval:
             result["automatic_review"] = dict(approval, outputs_sha256={k: digest(v) for k, v in outputs.items()})
         return result
+
+    @staticmethod
+    def review_files_hash(files):
+        return object_hash(sorted(files, key=lambda file: file["path"]))
+
+    def verify_delta_scope(self, outside_feedback):
+        if not outside_feedback:
+            return
+        examples = "、".join(map(str, outside_feedback[:20]))
+        issue = f"打回范围外共有 {len(outside_feedback)} 帧变化（最多列 20 帧：{examples}）。恢复打回范围外的基版画面。"
+        if self.dual_role:
+            raise visual_review.RevisionNeeded([dict(start=outside_feedback[0], end=outside_feedback[0], issue=issue)])
+        raise ValueError(issue)
 
     def stage_bundle(self, scene):
         portable = self.root / "packed-scene"
@@ -551,6 +604,8 @@ class Production:
 先读 feedback-summary.json，再按需要检查 feedback.json 原文、圈选图及连续源帧。按帧号核对受影响的动作范围和相邻帧，修改 scene.blend 及需要更新的 meta.jsonl。
 圈选坐标相对于整张上下对比图，上方原片、下方白模。补建网格使用包内 production_palette.apply_palette 并保留原来的人体几何及其配色属性。
 """
+        if self.rejected_frames is not None:
+            phase += "本工单只更新返修单标记的帧。其余帧必须与基版像素一致。调整动画或镜头时，请限制关键帧和插值的影响范围。\n"
         technical = (f"\n工程核验失败，工作台要求做一次技术修复。实际错误：{repair}\n"
                      "仅修复此问题及直接受影响的文件。修正后保存最新工程和制作记录。") if repair else ""
         if os.name == "nt":

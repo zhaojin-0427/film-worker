@@ -75,6 +75,12 @@ paths:
         schema:
           const: node_local_v1
         description: 此次注册的实例支持同机审片。旧版可省略。仅服务端给工单加 review_storage 时启用。
+      - name: X-Film-Worker-Review-Upload
+        in: header
+        required: false
+        schema:
+          const: rejected_frames_v1
+        description: 支持接收、上传及读取返修增量版本。服务端启用时在返修 input_manifest 中明示 review_upload。
       requestBody:
         required: true
         content:
@@ -1391,6 +1397,9 @@ components:
           description: 仅 finalize 工单可传。1080p 将画幅按原比例限制在横屏 1920×1080 或竖屏 1080×1920，输出轴取最接近的偶数。4k 使用基版的原生交付画幅，当前默认宽 3840。省略时沿用已通过版本原生交付画幅。
         review_storage:
           $ref: '#/components/schemas/LocalReviewStorage'
+        review_upload:
+          const: rejected_frames_v1
+          description: 仅返修工单。仅传 feedback_manifest 中标记的帧，其余帧由服务端继承。省略时上传完整审核包。
         artifacts:
           type: array
           items:
@@ -1401,6 +1410,12 @@ components:
         有 review_storage 的作业只向绑定实例发放，返修和出片从本机读取审片 ZIP 与工程。
         服务端保证关联同一作业和基版。节点校验工件摘要、作业身份及时间线。
       allOf:
+      - if:
+          required: [review_upload]
+        then:
+          properties:
+            kind:
+              const: revise
       - if:
           required: [export_quality]
         then:
@@ -2180,6 +2195,29 @@ components:
         - 2
         rgb8_hex: 000000ffffff
         expected_sha256: bd16c1d6572399a3c44d67a1c8445b907f6ff97a4a0d16b65a7ae046be695ca1
+    ReviewDelta:
+      type: object
+      additionalProperties: false
+      required: [mode, base_version, base_manifest_sha256, frames, full_files_sha256]
+      properties:
+        mode:
+          const: rejected_frames_v1
+        base_version:
+          type: integer
+          minimum: 1
+        base_manifest_sha256:
+          $ref: '#/components/schemas/Sha256'
+        frames:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          items:
+            type: integer
+            minimum: 1
+          description: 升序的打回帧编号，与 feedback_manifest 一致。
+        full_files_sha256:
+          $ref: '#/components/schemas/Sha256'
+          description: 合并后的全量 files 数组按 path 升序排序后，以 RFC 8785 规范化 JSON 计算的 SHA-256。
     ReviewBundleIndex:
       type: object
       additionalProperties: false
@@ -2221,6 +2259,8 @@ components:
           items:
             $ref: '#/components/schemas/BundleFile'
           minItems: 1
+        review_delta:
+          $ref: '#/components/schemas/ReviewDelta'
         frames:
           type: array
           items:
@@ -2230,6 +2270,8 @@ components:
         ZIP 根目录含 index.json。files 逐一索引 ZIP 内的其他文件。集中存储时包含上下对比 JPEG 和白模 PNG。
         同机模式只含 pairs/*.jpg，各帧的 white_png_path 指向执行端本机文件，服务端无需读取。
         管理端验证 ZIP 内实际条目的大小、SHA-256、JPEG 尺寸及帧覆盖后才入库。
+        有 review_delta 时 files 只索引实际上传的打回帧文件，frames 仍覆盖全片。其余文件取自所绑定的基版。
+        合并后的全量 ZIP 省略 review_delta，files 覆盖合并后的全量条目。
       allOf:
       - if:
           required: [review_storage]
@@ -2284,6 +2326,9 @@ components:
           $ref: '#/components/schemas/Sha256'
         review_bundle_sha256:
           $ref: '#/components/schemas/Sha256'
+          description: 实际上传的审核 ZIP 摘要，增量模式指增量 ZIP。
+        review_delta:
+          $ref: '#/components/schemas/ReviewDelta'
         shot_metadata_sha256:
           $ref: '#/components/schemas/Sha256'
         production_report_sha256:

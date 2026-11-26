@@ -15,6 +15,8 @@ from urllib.request import HTTPRedirectHandler, HTTPSHandler, Request, build_ope
 
 REVIEW_STORAGE_HEADER = "X-Film-Worker-Review-Storage"
 LOCAL_REVIEW_MODE = "node_local_v1"
+REVIEW_UPLOAD_HEADER = "X-Film-Worker-Review-Upload"
+REJECTED_FRAMES_MODE = "rejected_frames_v1"
 
 
 class ProtocolError(Exception):

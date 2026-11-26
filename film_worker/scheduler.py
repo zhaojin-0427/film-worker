@@ -17,8 +17,8 @@ from . import bundles
 from .model_recovery import ResumeLease, location as recovery_location
 from .progress import Progress, panel_details
 from .processes import ProcessTree
-from .protocol import (LOCAL_REVIEW_MODE, REVIEW_STORAGE_HEADER, Client, Interrupted, ProtocolError,
-                       Transfer, digest, key, opaque, valid_digest)
+from .protocol import (LOCAL_REVIEW_MODE, REJECTED_FRAMES_MODE, REVIEW_STORAGE_HEADER, REVIEW_UPLOAD_HEADER,
+                       Client, Interrupted, ProtocolError, Transfer, digest, key, opaque, valid_digest)
 from .settings import (KINDS, REVIEW_FIELDS, ROOT, atomic_json, environment, inspect_tools, object_hash,
                        production_settings, registration, resolve_tools, validate_config)
 from .state import State, identity, slot
@@ -223,8 +223,10 @@ class Scheduler:
                         payload = registration(self.cfg, self.instance_id, self.versions)
                         self.work_kinds = payload["capabilities"]["work_kinds"]
                         self.session, _ = self.api.json("POST", "/workers/register", body=payload,
-                                                         headers={"Idempotency-Key": key(self.instance_id, payload, LOCAL_REVIEW_MODE),
-                                                                  REVIEW_STORAGE_HEADER: LOCAL_REVIEW_MODE})
+                                                         headers={"Idempotency-Key": key(self.instance_id, payload, LOCAL_REVIEW_MODE,
+                                                                                         REJECTED_FRAMES_MODE),
+                                                                  REVIEW_STORAGE_HEADER: LOCAL_REVIEW_MODE,
+                                                                  REVIEW_UPLOAD_HEADER: REJECTED_FRAMES_MODE})
                         self.recover()
                     now = time.monotonic()
                     with self.lock:
@@ -301,6 +303,8 @@ class Scheduler:
             raise ValueError("工单和输入清单的标识不一致")
         if object_hash(order) != assignment["input_manifest_sha256"]:
             raise ValueError("输入清单摘要不匹配")
+        if "review_upload" in order and (order["kind"] != "revise" or order["review_upload"] != REJECTED_FRAMES_MODE):
+            raise WorkFailure(dict(code="input_invalid", message="工单的审核包上传模式不受支持", retryable=False))
         roles = {artifact["role"]: artifact for artifact in order["artifacts"]}
         if roles["source_video"]["size_bytes"] <= 0 or len(roles) != len(order["artifacts"]):
             raise ValueError("工单包含空原片或重复的工件角色")

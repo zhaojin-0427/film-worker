@@ -27,8 +27,9 @@ def entries(root):
             for p in sorted(root.rglob("*")) if p.is_file() and p != root / "index.json"]
 
 
-def build(root, index, output):
-    content = entries(root)
+def build(root, index, output, *, content=None):
+    if content is None:
+        content = entries(root)
     if not content:
         raise ValueError("归档为空")
     temp = output.with_suffix(".partial")

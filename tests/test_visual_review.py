@@ -9,9 +9,9 @@ from unittest.mock import patch
 
 from PIL import Image, JpegImagePlugin
 
-from film_worker import media, production, visual_review
-from film_worker.protocol import digest
-from film_worker.settings import REVIEW_JPEG, validate_config
+from film_worker import bundles, media, production, visual_review
+from film_worker.protocol import REJECTED_FRAMES_MODE, digest
+from film_worker.settings import REVIEW_JPEG, object_hash, validate_config
 
 
 class ReviewTests(unittest.TestCase):
@@ -85,6 +85,81 @@ class ReviewTests(unittest.TestCase):
                 result = worker.package_review(scene, meta)
             with zipfile.ZipFile(result["outputs"]["review_bundle"]) as archive:
                 self.assertEqual(archive.read("pairs/0001.jpg"), old.read_bytes())
+
+    def test_revision_uploads_only_rejected_frames_and_loads_the_merged_base(self):
+        for local in (False, True):
+            with self.subTest(local=local), tempfile.TemporaryDirectory() as folder:
+                root = Path(folder)
+                first, rendered, scene, meta = self.worker(root, "fine", local)
+                first.timeline_sha = digest(first.timeline_file)
+                with patch.object(first, "render", return_value=rendered):
+                    base_outputs = first.package_review(scene, meta)["outputs"]
+                base = media.read_json(Path(base_outputs["version_manifest"]))
+
+                def next_worker(name, outputs, base_version):
+                    job = root / name
+                    job.mkdir()
+                    worker, frames, _, _ = self.worker(job, "standard", local)
+                    worker.kind = "revise"
+                    worker.order.update(kind="revise", base_version=base_version, target_version=base_version + 1,
+                                        review_upload=REJECTED_FRAMES_MODE)
+                    worker.sources = {role: Path(path) for role, path in outputs.items()}
+                    worker.sources["source_timeline"] = first.timeline_file
+                    worker.timeline_sha = digest(first.timeline_file)
+                    if local:
+                        worker.local_version = worker.sources["version_manifest"].parent.parent
+                        worker.sources["scene_bundle"] = worker.local_version / "out/scene.zip"
+                        worker.sources["review_bundle"] = worker.local_version / "out/review.zip"
+                    return worker, frames
+
+                revision, frames = next_worker("revision", base_outputs, 1)
+                revision.load_previous()
+                freeze = dict(job_id=base["job_id"], base_version=1, original_annotator_id="alice",
+                              timeline_sha256=base["timeline_sha256"],
+                              base_manifest_sha256=digest(revision.sources["version_manifest"]))
+                manifests = {
+                    "feedback_manifest": dict(freeze, frames=[base["frames"][1]], review_size=base["review_size"]),
+                    "approval_manifest": dict(freeze, source_sha256=base["source_sha256"], scene_sha256=base["scene_sha256"],
+                                              frame_count=base["frame_count"], scope="approved_subset", frames=[base["frames"][0]]),
+                }
+                for role, data in manifests.items():
+                    revision.sources[role] = revision.root / (role + ".json")
+                    media.write_json(revision.sources[role], data)
+                Image.new("RGB", revision.review_size, "red").save(frames / "0002.png")
+                with patch.object(revision, "author_and_validate"), patch.object(revision, "render", return_value=frames):
+                    outputs = revision.create_review(None)["outputs"]
+                    Image.new("RGB", revision.review_size, "blue").save(frames / "0003.png")
+                    with self.assertRaisesRegex(ValueError, "打回范围外"):
+                        revision.create_review(None)
+
+                version = media.read_json(Path(outputs["version_manifest"]))
+                delta = version["review_delta"]
+                self.assertEqual(delta["frames"], [2])
+                self.assertEqual(delta["base_manifest_sha256"], freeze["base_manifest_sha256"])
+                self.assertEqual(version["review_bundle_sha256"], digest(Path(outputs["review_bundle"])))
+                self.assertEqual([v["number"] for v in version["frames"]], [1, 2, 3])
+                for index in (0, 2):
+                    self.assertEqual(version["frames"][index], base["frames"][index])
+                self.assertNotEqual(version["frames"][1]["review_signature"], base["frames"][1]["review_signature"])
+
+                delta_path = root / "delta"
+                delta_index = bundles.extract(Path(outputs["review_bundle"]), delta_path, indexed=True)
+                self.assertEqual(delta_index.pop("review_delta"), delta)
+                self.assertEqual(delta_index["frames"], version["frames"])
+                expected = {"pairs/0002.jpg"} if local else {"pairs/0002.jpg", "white/0002.png"}
+                self.assertEqual({file["path"] for file in delta_index.pop("files")}, expected)
+                merged = root / "merged"
+                bundles.extract(Path(base_outputs["review_bundle"]), merged, indexed=True)
+                for path in expected:
+                    (merged / path).write_bytes((delta_path / path).read_bytes())
+                self.assertEqual(object_hash(bundles.entries(merged)), delta["full_files_sha256"])
+                if not local:
+                    full = root / "merged.zip"
+                    bundles.build(merged, delta_index, full)
+                    outputs["review_bundle"] = str(full)
+                followup, _ = next_worker("followup", outputs, 2)
+                followup.load_previous()
+                self.assertEqual(followup.previous, version)
 
     def test_auditor_starts_on_first_pair_and_approval_binds_output(self):
         with tempfile.TemporaryDirectory() as folder:
