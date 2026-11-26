@@ -4,7 +4,6 @@ import json
 import math
 import runpy
 import sys
-import tempfile
 from fractions import Fraction
 from functools import lru_cache
 from pathlib import Path
@@ -14,6 +13,7 @@ from mathutils import Euler, Quaternion, Vector
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from actor_guard import ACTOR_GEOMETRY, assert_unchanged, capture
+from artifact_staging import staging_directory
 from engineering_checks import EngineeringValidationError, require_cycles
 from shot_draft import inputs_hash
 from production_palette import ACTOR_ROLES, PALETTE, PROP_ROLES, ROLE_PROPERTY, apply_palette, color, material
@@ -395,8 +395,7 @@ def compile_plan(stage, preview):
     if not fixed_palette:
         bpy.ops.file.pack_all()
     bpy.context.preferences.filepaths.save_version = 0
-    with tempfile.TemporaryDirectory(dir=stage, prefix=".compile-") as tmp:
-        folder = Path(tmp)
+    with staging_directory(stage, prefix=".compile-") as folder:
         if "FINISHED" not in bpy.ops.wm.save_as_mainfile(filepath=str(folder / "scene.blend"), compress=True):
             raise RuntimeError("无法保存 Blender 工程")
         (folder / "meta.jsonl").write_text("".join(json.dumps(s, ensure_ascii=False) + "\n" for s in meta), encoding="utf-8")

@@ -10,12 +10,49 @@ from pathlib import Path
 from unittest.mock import patch
 
 from film_worker import draft_review, media, production, shot_draft
+from film_worker.artifact_staging import staging_directory
 from film_worker.engineering_checks import EngineeringValidationError
 from film_worker.settings import DEFAULTS, ROOT, resolve_tools
 
 
 @unittest.skipUnless(os.name == "nt", "Windows review regression")
 class WindowsReviewTests(unittest.TestCase):
+    def test_artifact_publication_keeps_job_acl(self):
+        import ntsecuritycon
+        import win32security as security
+
+        sid = security.CreateWellKnownSid(security.WinLocalServiceSid, None)
+        with tempfile.TemporaryDirectory() as temp:
+            job = Path(temp) / "job"
+            job.mkdir()
+            info = security.DACL_SECURITY_INFORMATION
+            acl = security.GetNamedSecurityInfo(str(job), security.SE_FILE_OBJECT, info).GetSecurityDescriptorDacl()
+            acl.AddAccessAllowedAceEx(security.ACL_REVISION, security.OBJECT_INHERIT_ACE | security.CONTAINER_INHERIT_ACE,
+                                      ntsecuritycon.FILE_GENERIC_READ, sid)
+            security.SetNamedSecurityInfo(str(job), security.SE_FILE_OBJECT, info, None, None, acl, None)
+
+            with staging_directory(job, prefix=".test-stage-") as folder:
+                intake = folder / "intake"
+                intake.mkdir()
+                (intake / "timeline.json").write_bytes(b"{}")
+                intake.rename(job / "intake")
+                (job / "scene.blend").write_bytes(b"previous scene")
+                candidate = folder / "scene.blend"
+                candidate.write_bytes(b"new scene")
+                candidate.replace(job / "scene.blend")
+
+            self.assertFalse(folder.exists())
+            self.assertEqual((job / "scene.blend").read_bytes(), b"new scene")
+            for path in (job / "intake", job / "intake" / "timeline.json", job / "scene.blend"):
+                with self.subTest(path=path):
+                    acl = security.GetNamedSecurityInfo(str(path), security.SE_FILE_OBJECT, info).GetSecurityDescriptorDacl()
+                    self.assertTrue(any(
+                        principal == sid and flags & security.INHERITED_ACE
+                        and mask & ntsecuritycon.FILE_GENERIC_READ == ntsecuritycon.FILE_GENERIC_READ
+                        for (kind, flags), mask, principal in (acl.GetAce(i) for i in range(acl.GetAceCount()))
+                        if kind == security.ACCESS_ALLOWED_ACE_TYPE
+                    ), f"{path} lost the inherited job read permission")
+
     def test_codex_prompt_leaves_draft_encoding_to_worker(self):
         with tempfile.TemporaryDirectory() as temp:
             source = Path(temp) / "source.mp4"

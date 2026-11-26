@@ -4,12 +4,12 @@ import os
 import shutil
 import subprocess
 import sys
-import tempfile
 from fractions import Fraction
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from film_worker.actor_guard import ACTOR_GEOMETRY
+from film_worker.artifact_staging import staging_directory
 from film_worker.media import (add_audio, comparison, encode_images, even, frame_path, intake,
                                read_json, rgb, validate_encoded, write_json)
 from film_worker.progress import Progress
@@ -47,8 +47,7 @@ def generate(stage, source, blender, threads, backend="cpu", *, progress=None):
     width, height = (even(dimension * scale) for dimension in size)
     pair_size = width, 2 * height
 
-    with tempfile.TemporaryDirectory(dir=stage, prefix=".draft-review-") as temp:
-        folder = Path(temp)
+    with staging_directory(stage, prefix=".draft-review-") as folder:
         frames = folder / "frames"
         candidate = folder / "scene.blend"
         shutil.copyfile(scene, candidate)

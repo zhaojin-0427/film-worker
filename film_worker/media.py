@@ -4,7 +4,6 @@ import json
 import os
 import shutil
 import subprocess
-import tempfile
 from fractions import Fraction
 from pathlib import Path
 
@@ -14,6 +13,7 @@ from PIL import Image
 
 
 from . import intake
+from .artifact_staging import staging_directory
 
 
 def read_json(path):
@@ -64,8 +64,8 @@ def prepare_source(directory, source, requested_width):
         origin = (Fraction(audio["time_base"]) * int(audio["start_pts"]) if "start_pts" in audio
                   else Fraction(audio.get("start_time", "0")))
         timeline["audio_offset"] = str(origin - pts[0] * base)
-    with tempfile.TemporaryDirectory(dir=directory, prefix="intake-") as tmp:
-        stage = Path(tmp) / "intake"
+    with staging_directory(directory, prefix="intake-") as tmp:
+        stage = tmp / "intake"
         frames = stage / "frames"
         frames.mkdir(parents=True)
         transfer = video.get("color_transfer")
