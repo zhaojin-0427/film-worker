@@ -363,8 +363,9 @@ class Production:
         (review_root / "pairs").mkdir(parents=True, exist_ok=True)
         (white_root / "white").mkdir(parents=True, exist_ok=True)
         frames = []
-        outside_feedback = []
+        submitted = self.rejected_frames.copy() if self.rejected_frames is not None else None
         prior = {row["number"]: row for row in self.previous["frames"]} if self.previous else {}
+
         def save_pair(i, rendered):
             png = media.frame_path(rendered, i)
             white = media.rgb(png)
@@ -374,11 +375,11 @@ class Production:
             png_name = f"white/{i:04d}.png"
             target = review_root / jpg_name
             unchanged = i in prior and prior[i]["review_signature"] == signature
-            if self.rejected_frames is not None and i not in self.rejected_frames:
+            if submitted is not None and i not in submitted:
                 if unchanged:
                     png = self.prior_white / bundles.safe_path(prior[i]["white_png_path"])
                 else:
-                    outside_feedback.append(i)
+                    submitted.add(i)
             if unchanged:
                 shutil.copyfile(self.prior_review / bundles.safe_path(prior[i]["pair_jpeg_path"]), target)
             else:
@@ -423,7 +424,6 @@ class Production:
 
             try:
                 self.render(scene, self.review_size, "review", on_frames=on_frames)
-                self.verify_delta_scope(outside_feedback)
                 if rejection is None:
                     self.progress("codex_auditor")
                     approval = check_review(review.finish)
@@ -434,7 +434,6 @@ class Production:
             for i in range(1, self.count + 1):
                 self.progress("compare_review", i, self.count)
                 save_pair(i, rendered)
-            self.verify_delta_scope(outside_feedback)
         if len(frames) != self.count or digest(scene) != scene_sha or (approval and approval["scene_sha256"] != scene_sha):
             raise visual_review.VisualReviewError("送审帧不完整或审核期间工程已变化")
         common = dict(schema_version=1, job_id=self.order["job_id"], source_sha256=self.timeline["source_sha256"],
@@ -463,12 +462,12 @@ class Production:
             rows = []
             for frame in frames:
                 number = frame["number"]
-                if self.rejected_frames is None or number in self.rejected_frames:
+                if submitted is None or number in submitted:
                     item = by_path[frame["pair_jpeg_path"]]
                     rows.append(dict(number=number, size_bytes=item["size_bytes"], sha256=item["sha256"]))
             media.write_json(review_index, dict(index_fields, frames=rows))
             common["review_index_sha256"] = digest(review_index)
-        elif self.rejected_frames is None:
+        elif submitted is None:
             bundles.build(review_root, index, review_bundle)
         else:
             full_files = bundles.entries(review_root)
@@ -479,11 +478,10 @@ class Production:
                 raise ValueError("审核包文件与全帧索引不一致")
             delta = dict(mode=REJECTED_FRAMES_MODE, base_version=self.previous["version"],
                          base_manifest_sha256=digest(self.sources["version_manifest"]),
-                         frames=sorted(self.rejected_frames), full_files_sha256=self.review_files_hash(full_files))
-            changed_paths = {f"pairs/{n:04d}.jpg" for n in self.rejected_frames}
-            if not self.review_storage:
-                changed_paths.update(f"white/{n:04d}.png" for n in self.rejected_frames)
-            delta_files = [file for file in full_files if file["path"] in changed_paths]
+                         frames=sorted(submitted), full_files_sha256=self.review_files_hash(full_files))
+            roles = ("pair_jpeg_path",) if self.review_storage else ("pair_jpeg_path", "white_png_path")
+            submitted_paths = {frame[role] for frame in frames if frame["number"] in submitted for role in roles}
+            delta_files = [file for file in full_files if file["path"] in submitted_paths]
             if self.review_storage:
                 bundles.build(review_root, index, review_bundle, content=full_files)
             review_bundle = self.output / "review-delta.zip"
@@ -520,15 +518,6 @@ class Production:
     @staticmethod
     def review_files_hash(files):
         return object_hash(sorted(files, key=lambda file: file["path"]))
-
-    def verify_delta_scope(self, outside_feedback):
-        if not outside_feedback:
-            return
-        examples = "、".join(map(str, outside_feedback[:20]))
-        issue = f"打回范围外共有 {len(outside_feedback)} 帧变化（最多列 20 帧：{examples}）。恢复打回范围外的基版画面。"
-        if self.dual_role:
-            raise visual_review.RevisionNeeded([dict(start=outside_feedback[0], end=outside_feedback[0], issue=issue)])
-        raise ValueError(issue)
 
     def stage_bundle(self, scene):
         portable = self.root / "packed-scene"
@@ -677,7 +666,9 @@ class Production:
 圈选坐标相对于整张上下对比图，上方原片、下方白模。补建网格使用包内 production_palette.apply_palette 并保留原来的人体几何及其配色属性。
 """
         if self.rejected_frames is not None:
-            phase += "本工单只更新返修单标记的帧。其余帧必须与基版像素一致。调整动画或镜头时，请限制关键帧和插值的影响范围。\n"
+            phase += ("优先修正打回帧。调整镜头、关键帧或插值时，可一并修正直接受影响的相邻帧，"
+                      "保证动作连续。保留无关画面，并在制作记录注明实际修改的帧段。"
+                      "执行端按全片签名比对，送审全部打回帧及其余发生变化的帧。\n")
         technical = (f"\n工程核验失败，工作台要求做一次技术修复。实际错误：{repair}\n"
                      "仅修复此问题及直接受影响的文件。修正后保存最新工程和制作记录。") if repair else ""
         if os.name == "nt":

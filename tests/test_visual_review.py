@@ -100,7 +100,7 @@ class ReviewTests(unittest.TestCase):
             with zipfile.ZipFile(result["outputs"]["review_bundle"]) as archive:
                 self.assertEqual(archive.read("pairs/0001.jpg"), old.read_bytes())
 
-    def test_revision_uploads_only_rejected_frames_and_loads_the_merged_base(self):
+    def test_revision_uploads_rejected_and_changed_frames_and_loads_the_merged_base(self):
         for local in (False, True):
             with self.subTest(local=local), tempfile.TemporaryDirectory() as folder:
                 root = Path(folder)
@@ -140,27 +140,27 @@ class ReviewTests(unittest.TestCase):
                     revision.sources[role] = revision.root / (role + ".json")
                     media.write_json(revision.sources[role], data)
                 Image.new("RGB", revision.review_size, "red").save(frames / "0002.png")
+                Image.new("RGB", revision.review_size, "blue").save(frames / "0001.png")
                 with patch.object(revision, "author_and_validate"), patch.object(revision, "render", return_value=frames):
                     outputs = revision.create_review(None)["outputs"]
-                    Image.new("RGB", revision.review_size, "blue").save(frames / "0003.png")
-                    with self.assertRaisesRegex(ValueError, "打回范围外"):
-                        revision.create_review(None)
 
                 version = media.read_json(Path(outputs["version_manifest"]))
                 delta = version["review_delta"]
-                self.assertEqual(delta["frames"], [2])
+                self.assertEqual(delta["frames"], [1, 2])
                 self.assertEqual(delta["base_manifest_sha256"], freeze["base_manifest_sha256"])
                 self.assertEqual(version["review_bundle_sha256"], digest(Path(outputs["review_bundle"])))
                 self.assertEqual([v["number"] for v in version["frames"]], [1, 2, 3])
-                for index in (0, 2):
-                    self.assertEqual(version["frames"][index], base["frames"][index])
-                self.assertNotEqual(version["frames"][1]["review_signature"], base["frames"][1]["review_signature"])
+                self.assertEqual(version["frames"][2], base["frames"][2])
+                for index in (0, 1):
+                    self.assertNotEqual(version["frames"][index]["review_signature"], base["frames"][index]["review_signature"])
 
                 delta_path = root / "delta"
                 delta_index = bundles.extract(Path(outputs["review_bundle"]), delta_path, indexed=True)
                 self.assertEqual(delta_index.pop("review_delta"), delta)
                 self.assertEqual(delta_index["frames"], version["frames"])
-                expected = {"pairs/0002.jpg"} if local else {"pairs/0002.jpg", "white/0002.png"}
+                expected = {"pairs/0001.jpg", "pairs/0002.jpg"}
+                if not local:
+                    expected |= {"white/0001.png", "white/0002.png"}
                 self.assertEqual({file["path"] for file in delta_index.pop("files")}, expected)
                 merged = root / "merged"
                 bundles.extract(Path(base_outputs["review_bundle"]), merged, indexed=True)
@@ -219,26 +219,28 @@ class ReviewTests(unittest.TestCase):
             }.items():
                 revision.sources[role] = second / (role + ".json")
                 media.write_json(revision.sources[role], manifest)
-            Image.new("RGB", revision.review_size, "red").save(rendered / "0002.png")
+            Image.new("RGB", revision.review_size, "red").save(rendered / "0001.png")
             with patch.object(revision, "author_and_validate"), patch.object(revision, "render", return_value=rendered):
                 revised = revision.create_review(None)["outputs"]
             files = files_for(revision, revised)
-            self.assertEqual(set(files), {"review-index.json", "version.json", "production.json", "meta.jsonl", "pairs/000002.jpg"})
+            pairs = ("pairs/000001.jpg", "pairs/000002.jpg")
+            self.assertEqual(set(files), {"review-index.json", "version.json", "production.json", "meta.jsonl", *pairs})
             index = media.read_json(files["review-index.json"].path)
             version = media.read_json(files["version.json"].path)
-            self.assertEqual(index["frames"], [dict(number=2, **files["pairs/000002.jpg"].declaration())])
+            self.assertEqual(index["frames"], [dict(number=n, **files[path].declaration()) for n, path in enumerate(pairs, 1)])
             self.assertEqual(index["base_manifest_sha256"], first_files["version.json"].sha256)
             self.assertEqual(version["review_index_sha256"], files["review-index.json"].sha256)
             self.assertEqual(version["review_media"], OSS_OBJECTS)
-            self.assertEqual(version["frames"][::2], base["frames"][::2])
-            self.assertNotEqual(version["frames"][1]["review_signature"], base["frames"][1]["review_signature"])
+            self.assertEqual(version["frames"][1:], base["frames"][1:])
+            self.assertNotEqual(version["frames"][0]["review_signature"], base["frames"][0]["review_signature"])
             with zipfile.ZipFile(revised["review_bundle"]) as local:
-                self.assertEqual(local.read("pairs/000001.jpg"), first_files["pairs/000001.jpg"].path.read_bytes())
-                self.assertEqual(local.read("pairs/000003.jpg"), first_files["pairs/000003.jpg"].path.read_bytes())
+                for path in ("pairs/000002.jpg", "pairs/000003.jpg"):
+                    self.assertEqual(local.read(path), first_files[path].path.read_bytes())
             oss_delivery.package_manual_objects(revision.request["assignment"], second, files, None, Event(), Mock())
             with zipfile.ZipFile(second / "submission.zip") as manual:
                 self.assertEqual(set(manual.namelist()), set(files))
-                self.assertEqual(manual.read("pairs/000002.jpg"), files["pairs/000002.jpg"].path.read_bytes())
+                for path in pairs:
+                    self.assertEqual(manual.read(path), files[path].path.read_bytes())
 
     def test_auditor_starts_on_first_pair_and_approval_binds_output(self):
         with tempfile.TemporaryDirectory() as folder:

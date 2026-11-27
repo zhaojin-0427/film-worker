@@ -1814,6 +1814,7 @@ components:
               enum: [objects_v1, zip_v1]
             review_scope:
               enum: [all_frames, rejected_frames, null]
+              description: 返修的 rejected_frames 表示必须提交全部打回帧，也可提交其他变化帧。
             source_url:
               type: string
               format: uri
@@ -2376,7 +2377,7 @@ components:
           items:
             type: integer
             minimum: 1
-          description: 升序的打回帧编号，与 feedback_manifest 一致。
+          description: 实际上传的升序帧号，包含 feedback_manifest 的所有打回帧和其他变化帧。
         full_files_sha256:
           $ref: '#/components/schemas/Sha256'
           description: 合并后的全量 files 数组按 path 升序排序后，以 RFC 8785 规范化 JSON 计算的 SHA-256。
@@ -2432,7 +2433,7 @@ components:
         ZIP 根目录含 index.json。files 逐一索引 ZIP 内的其他文件。集中存储时包含上下对比 JPEG 和白模 PNG。
         同机模式只含 pairs/*.jpg，各帧的 white_png_path 指向执行端本机文件，服务端无需读取。
         管理端验证 ZIP 内实际条目的大小、SHA-256、JPEG 尺寸及帧覆盖后才入库。
-        有 review_delta 时 files 只索引实际上传的打回帧文件，frames 仍覆盖全片。其余文件取自所绑定的基版。
+        有 review_delta 时 files 索引打回帧和随同上传的其他变化帧文件，frames 仍覆盖全片。其余文件取自所绑定的基版。
         合并后的全量 ZIP 省略 review_delta，files 覆盖合并后的全量条目。
       allOf:
       - if:
