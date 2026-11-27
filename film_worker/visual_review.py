@@ -12,6 +12,7 @@ from PIL import Image, ImageDraw, ImageOps
 
 from . import model_recovery, quality
 from .progress import write_progress
+from .production_palette import prompt_table
 from .protocol import digest
 from .settings import object_hash
 
@@ -19,6 +20,7 @@ from .settings import object_hash
 MAX_REPAIRS = 2
 REVIEW_SECONDS = 30 * 60
 AUDITOR = "codex-auditor"
+CONCLUSION_VERSION = 2
 
 
 class VisualReviewError(RuntimeError):
@@ -59,16 +61,20 @@ def conclusion(raw, *, count, required, available):
                 or any(type(n) is not int or n not in available for n in inspected)
                 or not isinstance(issues, list) or len(issues) > 20):
             raise ValueError
+        structured = []
         for item in issues:
-            start, end, issue = (item[key] for key in ("start", "end", "issue"))
+            start, end, source, difference, fix = (item[key] for key in ("start", "end", "source", "difference", "fix"))
             if (type(start) is not int or type(end) is not int or not 1 <= start <= end <= count
-                    or not any(start <= n <= end for n in inspected) or not isinstance(issue, str)
-                    or not 1 <= len(issue.strip()) <= 400):
+                    or not any(start <= n <= end for n in inspected)
+                    or any(not isinstance(value, str) or not 1 <= len(value.strip()) <= 160
+                           for value in (source, difference, fix))):
                 raise ValueError
+            structured.append(dict(start=start, end=end, source=source.strip(), difference=difference.strip(),
+                                   fix=fix.strip(), issue=f"原片 {source.strip()}；偏差 {difference.strip()}；修改 {fix.strip()}"))
     except (ValueError, KeyError, TypeError):
         raise VisualReviewError("独立审核没有返回有效的可追溯结论") from None
     if verdict == "revise" and issues:
-        raise RevisionNeeded(issues)
+        raise RevisionNeeded(structured)
     if verdict != "pass" or issues or not set(required).issubset(inspected):
         raise VisualReviewError("独立审核证据不足，或仍有待修正的问题")
     return sorted(set(inspected)), result.get("review_token")
@@ -81,7 +87,8 @@ class VisualReview:
         self.required = required
         self.preview = preview
         self.additional = additional
-        self.fingerprint = object_hash([self.scene_sha, required, preview, worker.review_clarity])
+        self.fingerprint = object_hash([self.scene_sha, required, preview, worker.review_clarity, additional,
+                                        quality.L3_RULES, quality.REVIEW_CHECKLIST, prompt_table(), CONCLUSION_VERSION])
         self.directory = worker.root / "visual-review" / self.fingerprint
         self.directory.mkdir(parents=True, exist_ok=True)
         self.queue = self.directory / "frames.json"
@@ -149,11 +156,14 @@ class VisualReview:
 禁止修改工程、反馈、图像、配置或上传任何数据。你只输出最终 JSON。
 本轮是{"正式渲染前的低清试审，重点拦截可辨认的明显偏差" if self.preview else "正式送审复核，重点检查低清试审后仍存在的画面偏差"}。
 {self.additional}
-按实际画面检查镜头、角色朝向、动作、时序、遮挡、接触和色彩。连续帧一起看。
-发现明确需返修的问题时可以立即返回 revise，写出帧段、实际差异和具体修法。
+先检查 L3 基础外观和工作台配色，再检查镜头、姿态、接触、遮挡和动作节奏。连续帧一起看，遇到新增部件或材质改造时给出帧段并要求恢复 L3。
+{quality.L3_RULES}
+工作台固定配色
+{prompt_table()}
+发现明确需返修的问题可以立即返回 revise。每条提供帧段、原片表现 source、复刻偏差 difference 和可执行修改 fix。人物返修限定在上述动作范围，构图、裁切或透视问题指出具体镜头调整。
 pass 仅在 complete 为 true 且打开并核对全部图后返回。列出实际看过的源帧，并原样带回 frames.json 的 review_token。
 只返回 JSON，例如 {{"verdict":"pass","inspected":[1,2],"issues":[],"review_token":"从最后的 frames.json 读取"}} 或
-{{"verdict":"revise","inspected":[2],"issues":[{{"start":2,"end":2,"issue":"人物头部朝向需向画面右侧调整"}}]}}。
+{{"verdict":"revise","inspected":[2],"issues":[{{"start":2,"end":2,"source":"头朝画面右侧","difference":"白模头部正对镜头","fix":"将头部关节转向画面右侧，并核对前后相邻帧"}}]}}。
 {quality.REVIEW_CHECKLIST}"""
         return worker.run_auditor(prompt, self.directory, self.fingerprint, self.cancelled,
                                   time.monotonic() + REVIEW_SECONDS, preview=self.preview)

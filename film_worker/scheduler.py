@@ -201,7 +201,7 @@ class Scheduler:
     def summary(self):
         with self.lock:
             active = list(self.active.items())
-            state = {**self.status, "draining": self.drain.is_set(),
+            state = {**self.status, "draining": self.drain.is_set(), "stopping": self.stop_after_drain.is_set(),
                      "slots": self.cfg["slots"], "free_gib": shutil.disk_usage(self.root).free // 1024**3,
                      "versions": self.versions}
         attempts = []
@@ -641,12 +641,13 @@ class Scheduler:
                            model_slots=self.cfg["model_slots"], render_slots=self.cfg["render_slots"],
                            review_settings=self.review_settings(directory),
                            codex_lease_owner=transfer.resume_lease.owner)
-            atomic_json(directory / "request.json", request)
             credentials = {"FILM_WORKER_TOKEN", "OSS_ACCESS_KEY_ID", "OSS_ACCESS_KEY_SECRET",
                            "ALIBABA_CLOUD_ACCESS_KEY_ID", "ALIBABA_CLOUD_ACCESS_KEY_SECRET"}
             env = {name: value for name, value in os.environ.items() if name.upper() not in credentials}
             env["PYTHONUTF8"] = "1"
-            with (directory / "worker.log").open("ab") as log:
+            with (slot(directory.parent, "production", 1, transfer.stop),
+                  (directory / "worker.log").open("ab") as log):
+                atomic_json(directory / "request.json", request)
                 tree = ProcessTree([sys.executable, "-m", "film_worker", "child", str(directory)],
                                    cwd=ROOT, env=env, log=log)
                 try:
@@ -654,7 +655,7 @@ class Scheduler:
                         if transfer.stop.wait(0.25):
                             raise Interrupted
                 finally:
-                    tree.close()
+                    tree.close(wait_for_children=True)
             if tree.child.returncode or not result_file.is_file():
                 error_file = directory / "error.json"
                 error = read(error_file) if error_file.is_file() else dict(code="render_failed", message="制作进程中止")

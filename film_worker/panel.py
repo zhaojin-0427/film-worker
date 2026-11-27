@@ -292,15 +292,19 @@ class Handler(BaseHTTPRequestHandler):
                 elif self.path in ("/api/drain", "/api/resume", "/api/stop"):
                     if node.scheduler and node.runner.is_alive():
                         if self.path == "/api/drain":
-                            node.scheduler.drain.set()
                             node.scheduler.state.set("claims_paused", True)
+                            node.scheduler.drain.set()
                         elif self.path == "/api/resume":
-                            node.scheduler.drain.clear()
+                            if node.scheduler.stop_after_drain.is_set():
+                                raise ValueError("节点正在停止，请在停止后重新启动")
                             node.scheduler.state.set("claims_paused", False)
+                            node.scheduler.drain.clear()
                         else:
                             if node.scheduler.summary()["active"] or not node.scheduler.drain.is_set():
                                 raise ValueError("请先暂停领单并等待在途工单完成")
-                            node.scheduler.stop.set()
+                            node.scheduler.stop_after_drain.set()
+                    elif self.path != "/api/stop":
+                        raise ValueError("请先启动节点")
                 else:
                     return self.reply(404, {"error": "未知操作"})
             self.reply(200, node.summary())

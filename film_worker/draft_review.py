@@ -33,12 +33,13 @@ def current(stage):
     return recorded == {"version": REVIEW_VERSION, "scene": intake.digest(scene), "movie": intake.digest(movie)}
 
 
-def generate(stage, source, blender, threads, backend="cpu", *, progress=None):
+def generate(stage, source, blender, threads, backend="cpu", *, progress=None, timeline_path=None):
     if current(stage):
         return stage / MOVIE
     scene = stage / "scene.blend"
     scene_hash = intake.digest(scene)
-    timeline_path = Path(read_json(stage / "draft-context.json")["timeline"])
+    if timeline_path is None:
+        timeline_path = Path(read_json(stage / "draft-context.json")["timeline"])
     timeline = read_json(timeline_path)
     if intake.digest(source) != timeline["source_sha256"]:
         raise ValueError("自检片原片与作业时间线不一致")
@@ -103,10 +104,12 @@ if __name__ == "__main__":
     parser.add_argument("--ffmpeg")
     parser.add_argument("--ffprobe")
     parser.add_argument("--report-progress", action="store_true")
+    parser.add_argument("--timeline", type=Path)
     args = parser.parse_args()
     for name in ("ffmpeg", "ffprobe"):
         if executable := getattr(args, name):
             os.environ["FILM_WORKER_" + name.upper()] = executable
     stage = args.stage.resolve()
     progress = Progress(stage.parent) if args.report_progress else None
-    print(generate(stage, args.source.resolve(), args.blender, args.threads, args.backend, progress=progress))
+    print(generate(stage, args.source.resolve(), args.blender, args.threads, args.backend, progress=progress,
+                   timeline_path=args.timeline))

@@ -10,12 +10,81 @@ import zipfile
 from pathlib import Path
 from unittest.mock import patch
 
-from film_worker import draft_review, media, production
+from PIL import Image
+
+from film_worker import draft_review, media, production, render_resume
 from film_worker.production import Production
-from film_worker.settings import DEFAULTS, resolve_tools
+from film_worker.protocol import digest
+from film_worker.settings import DEFAULTS, atomic_json, resolve_tools
 
 
 class ProductionTests(unittest.TestCase):
+    def test_new_attempt_reuses_matching_scene_and_renders_only_missing_review_frames(self):
+        with tempfile.TemporaryDirectory() as temp:
+            work = Path(temp) / "work" / "work-fixture"
+            assignment = dict(work_id=work.name, job_id="1", input_manifest_sha256="a" * 64,
+                              input_manifest=dict(kind="prepare", job_id="1", target_version=1))
+            common = dict(paths={}, tools={"blender": "blender"}, cpu_threads=2,
+                          environment=dict(render_backend="optix", compatibility={"blender": "5.2.3", "decoder_id": "test"}))
+
+            def make_worker(attempt, *, input_sha=assignment["input_manifest_sha256"], threads=2):
+                folder = work / str(attempt)
+                folder.mkdir(parents=True)
+                request = dict(common, cpu_threads=threads, assignment=dict(
+                    assignment, input_manifest_sha256=input_sha, lease=dict(attempt=attempt, worker_id="fixture")))
+                atomic_json(folder / "request.json", request)
+                worker = Production(folder, request)
+                worker.count = 5
+                worker.review_size = worker.final_size = (32, 18)
+                worker.previous = None
+                return worker
+
+            first = make_worker(1)
+            scene, meta = (first.stage / name for name in ("scene.blend", "meta.jsonl"))
+            scene.write_bytes(b"prepared scene")
+            meta.write_text('{"start_frame":1,"end_frame":5,"description":"shot"}\n', encoding="utf-8")
+            atomic_json(first.root / "prepared.json", dict(input=assignment["input_manifest_sha256"],
+                        scene=digest(scene), meta=digest(meta), environment=first.env))
+            frames = first.root / "review-optix"
+            atomic_json(frames / "checkpoint.json", first.render_tag(digest(scene), first.review_size, "optix"))
+            for number in (1, 2, 4):
+                Image.new("RGB", first.review_size, "red").save(media.frame_path(frames, number))
+            media.frame_path(frames, 3).write_bytes(b"incomplete PNG")
+            (frames / "rendering.png").write_bytes(b"temporary render")
+            before = {file.name: digest(file) for file in frames.iterdir()}
+
+            retry = make_worker(2)
+            missing = []
+
+            def render_missing(_name, _command, *, frames, **kwargs):
+                self.assertEqual(json.loads((retry.root / "progress.json").read_bytes())["completed"], 3)
+                for number in range(1, retry.count + 1):
+                    frame = media.frame_path(frames, number)
+                    if not frame.exists():
+                        missing.append(number)
+                        Image.new("RGB", retry.review_size, "blue").save(frame)
+
+            def package(restored_scene, restored_meta):
+                self.assertEqual(restored_scene.read_bytes(), scene.read_bytes())
+                self.assertEqual(restored_meta.read_bytes(), meta.read_bytes())
+                return retry.render_locked(restored_scene, retry.review_size, "review")
+
+            with (patch.object(retry, "author_and_validate") as author,
+                  patch.object(retry, "package_review", side_effect=package),
+                  patch.object(retry, "run_tool", side_effect=render_missing)):
+                result = retry.create_review(None)
+            author.assert_not_called()
+            self.assertEqual(missing, [3, 5])
+            self.assertEqual(json.loads((retry.root / "progress.json").read_bytes())["completed"], 5)
+            for number in (1, 2, 4):
+                self.assertEqual(digest(media.frame_path(result, number)), before[f"{number:04d}.png"])
+            self.assertFalse((result / "rendering.png").exists())
+            self.assertEqual({file.name: digest(file) for file in frames.iterdir()}, before)
+
+            for attempt, options in ((3, {"input_sha": "b" * 64}), (4, {"threads": 8})):
+                incompatible = make_worker(attempt, **options)
+                self.assertEqual(render_resume.previous_attempts(incompatible.root, incompatible.request), [])
+
     @unittest.skipUnless(os.environ.get("FILM_WORKER_TEST_MEDIA") == "1", "requires Blender and FFmpeg")
     def test_bundled_first_draft_repair_and_full_timeline_self_review(self):
         tools = resolve_tools(DEFAULTS)
@@ -36,13 +105,14 @@ class ProductionTests(unittest.TestCase):
             worker = Production(work, request)
             stages = []
 
-            def fixture(prompt, name):
+            def fixture(prompt, name, **options):
                 stages.append(name)
                 self.assertIn("制作 SOP", prompt)
                 self.assertIn(str(production.BODY_MODEL), prompt)
                 self.assertNotIn("workflow_bundle", prompt)
                 if name == "codex-self-review":
                     self.assertTrue(draft_review.current(worker.stage))
+                    self.assertTrue(options["context_hash"])
                     (worker.stage / "制作记录.md").write_text("已复查 F1–3", encoding="utf-8")
                     return
                 if name == "codex-repair":
@@ -65,6 +135,61 @@ class ProductionTests(unittest.TestCase):
             self.assertEqual(manifest["frame_count"], 3)
             with zipfile.ZipFile(result["outputs"]["scene_bundle"]) as saved:
                 self.assertIn(".actor-geometry.json", saved.namelist())
+            snapshot = worker.stage / ".actor-geometry.json"
+            legacy = root / "legacy-actor-geometry.json"
+            media.write_json(legacy, media.read_json(snapshot)["geometry"])
+            worker.run_tool("test-upgrade-actor-baseline", worker.blender_command(
+                "-b", "--disable-autoexec", str(worker.stage / "scene.blend"), "--python-exit-code", "1",
+                "-P", str(Path(production.__file__).with_name("actor_guard.py")), "--", str(legacy)))
+            self.assertEqual(media.read_json(legacy), media.read_json(snapshot))
+            guard_test = root / "check-actor-appearance.py"
+            guard_test.write_text("""
+import json
+import sys
+from pathlib import Path
+
+import bpy
+
+sys.path.insert(0, sys.argv[-2])
+from actor_guard import assert_unchanged
+from engineering_checks import EngineeringValidationError
+
+scene = bpy.context.scene
+snapshot = json.loads(Path(sys.argv[-1]).read_text(encoding="utf-8"))
+assert snapshot["schema_version"] == 2
+body = next(obj for obj in scene.objects if obj.get("movie_actor_body"))
+
+def check_blocked():
+    try:
+        assert_unchanged(scene, snapshot)
+    except EngineeringValidationError:
+        return
+    raise AssertionError("appearance change passed the guard")
+
+body.rotation_euler.x += 0.15
+assert_unchanged(scene, snapshot)
+material = body.material_slots[0].material
+shader = next(node for node in material.node_tree.nodes if node.type == "BSDF_PRINCIPLED")
+roughness = shader.inputs["Roughness"]
+original = roughness.default_value
+roughness.default_value = 0.1 if original > 0.5 else 0.8
+check_blocked()
+roughness.default_value = original
+assert_unchanged(scene, snapshot)
+
+bpy.ops.mesh.primitive_cube_add()
+added = bpy.context.object
+added.parent = body
+check_blocked()
+added.parent = None
+assert_unchanged(scene, snapshot)
+added.constraints.new("COPY_TRANSFORMS").target = body
+check_blocked()
+""", encoding="utf-8")
+            worker.run_tool("test-actor-appearance", worker.blender_command(
+                "-b", "--disable-autoexec", str(worker.stage / "scene.blend"), "--python-exit-code", "1",
+                "-P", str(guard_test), "--", str(Path(production.__file__).parent),
+                str(snapshot)))
 
     @unittest.skipUnless(os.environ.get("FILM_WORKER_TEST_MEDIA") == "1", "requires Blender, FFmpeg and FFprobe")
     def test_prepare_revise_finalize_from_frozen_artifacts(self):

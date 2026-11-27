@@ -17,6 +17,17 @@ from film_worker.state import State
 
 
 class ReviewTests(unittest.TestCase):
+    def test_repair_conclusion_requires_source_difference_and_action(self):
+        issue = dict(start=2, end=3, source="头朝右", difference="复刻头朝左", fix="转动头部关节")
+        result = dict(verdict="revise", inspected=[2], issues=[issue])
+        with self.assertRaises(visual_review.RevisionNeeded) as repair:
+            visual_review.conclusion(json.dumps(result), count=3, required=[1, 2, 3], available=[2])
+        self.assertEqual(repair.exception.issues[0]["fix"], "转动头部关节")
+        self.assertIn(issue["source"], str(repair.exception))
+        del issue["source"]
+        with self.assertRaisesRegex(visual_review.VisualReviewError, "可追溯结论"):
+            visual_review.conclusion(json.dumps(result), count=3, required=[1, 2, 3], available=[2])
+
     def worker(self, root, clarity, local, dual=False, objects=False):
         order = {"kind": "prepare", "job_id": "1", "target_version": 1}
         if local:

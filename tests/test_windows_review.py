@@ -124,7 +124,8 @@ output.write_text(json.dumps({'point': coords, 'frame': int(np.int64(1))}, allow
                 )
                 reviewed = []
 
-                def review(_, name):
+                def review(_, name, *, context_hash):
+                    self.assertTrue(context_hash)
                     self.assertEqual(name, "codex-self-review")
                     self.assertTrue(draft_review.current(worker.stage))
                     coordinates = json.loads((worker.stage / "checked-coordinates.json").read_text())

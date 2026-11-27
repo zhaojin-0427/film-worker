@@ -59,6 +59,13 @@ def write_feedback(stage, previous, version, frames):
     write_json(stage / "feedback.json", {"version": version, "frames": entries})
 
 
+def verify_rendered_frame(path, size):
+    with Image.open(path) as frame:
+        if frame.format != "PNG" or frame.size != size:
+            raise ValueError("PNG 尺寸不符")
+        frame.verify()
+
+
 def check_rendered_frames(folder, size, count, *, complete):
     """Only complete PNGs of the requested size can be resumed or published."""
     for number in range(1, count + 1):
@@ -66,10 +73,7 @@ def check_rendered_frames(folder, size, count, *, complete):
         if not path.exists() and not complete:
             continue
         try:
-            with Image.open(path) as frame:
-                if frame.format != "PNG" or frame.size != size:
-                    raise ValueError("PNG 尺寸不符")
-                frame.verify()
+            verify_rendered_frame(path, size)
         except (OSError, ValueError, SyntaxError) as exc:
             if complete:
                 raise ValueError(f"第 {number} 帧缺失、损坏或尺寸与 {size[0]}×{size[1]} 不符") from exc

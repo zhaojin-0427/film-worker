@@ -32,11 +32,14 @@
       <h1>制作工单</h1>
       <p id="capacity">正在读取节点状态</p>
     </div>
-    <div class="actions node-actions" aria-label="节点操作">
-      <button type="button" data-control="start">启动节点</button>
-      <button type="button" data-control="stop">停止节点</button>
-      <button type="button" data-control="drain">暂停领单</button>
-      <button type="button" class="primary" data-control="resume">恢复领单</button>
+    <div class="node-controls">
+      <div class="actions node-actions" aria-label="节点操作">
+        <button type="button" data-control="start">启动节点</button>
+        <button type="button" data-control="stop">停止节点</button>
+        <button type="button" data-control="drain">暂停领单</button>
+        <button type="button" class="primary" data-control="resume">恢复领单</button>
+      </div>
+      <p id="node-feedback" role="status"></p>
     </div>
   </header>
 

@@ -1,6 +1,50 @@
 const form = document.querySelector("#form");
 const notice = document.querySelector("#notice");
 let csrf = "";
+const nodeButtons = document.querySelectorAll(".node-actions [data-control]");
+const nodeFeedback = document.querySelector("#node-feedback");
+const nodeBusyLabels = {start: "启动中…", stop: "停止中…", drain: "暂停中…", resume: "恢复中…"};
+let nodeState = null;
+let nodeRequest = "";
+let nodeGeneration = 0;
+let pendingStop = false;
+
+function showNodeFeedback(text, state) {
+  nodeFeedback.textContent = text;
+  nodeFeedback.dataset.state = state;
+}
+
+function showNodeControls() {
+  const stopped = !nodeState?.slots;
+  const draining = nodeState?.draining;
+  const stopping = !stopped && (pendingStop || nodeState.stopping);
+  const capacity = document.querySelector("#capacity");
+  if (nodeState) {
+    capacity.textContent = stopping ? "节点正在停止" : stopped ? "节点已停止"
+      : draining ? "节点已暂停领单" : nodeState.connection === "connected" ? "节点正在接收工单"
+      : stateNames[nodeState.connection] ?? nodeState.connection;
+    capacity.title = nodeState.detail ?? "";
+  }
+  for (const button of nodeButtons) {
+    const action = button.dataset.control;
+    const busy = action === nodeRequest || (action === "stop" && stopping);
+    button.textContent = busy ? nodeBusyLabels[action] : button.dataset.label;
+    if (busy) button.setAttribute("aria-busy", "true");
+    else button.removeAttribute("aria-busy");
+    button.disabled = !csrf || !nodeState || Boolean(nodeRequest) || stopping
+      || (action === "start" ? !stopped : stopped)
+      || (action === "drain" && draining) || (action === "resume" && !draining);
+  }
+}
+
+function updateNodeState(state) {
+  nodeState = state;
+  if (pendingStop && state.connection === "stopped") {
+    pendingStop = false;
+    showNodeFeedback("节点已停止", "success");
+  }
+  showNodeControls();
+}
 
 function message(text, error = false) {
   notice.textContent = text;
@@ -343,6 +387,7 @@ function showLocalReviews(reviews) {
 }
 
 async function refresh() {
+  const generation = nodeGeneration;
   try {
     const state = await api("status");
     const badge = document.querySelector("#connection");
@@ -354,8 +399,7 @@ async function refresh() {
       `${release.version} · ${release.commit.slice(0, 12) || "本地版本"} · ${state.update_status}` : "";
     document.querySelector('[data-control="rollback"]').disabled = !state.managed || !state.rollback_available;
     document.querySelector('[data-control="update"]').disabled = !state.managed;
-    document.querySelector("#capacity").textContent = state.detail || (state.slots
-      ? (state.draining ? "节点已暂停领单" : "节点正在接收工单") : "节点待启动");
+    if (generation === nodeGeneration && !nodeRequest) updateNodeState(state);
     document.querySelector("#slot-status").textContent = state.slots ? `${state.active.length} / ${state.slots}` : "—";
     document.querySelector("#disk-status").textContent = state.free_gib == null ? "—" : `${state.free_gib} GiB`;
     document.querySelector("#blender-status").textContent = state.versions?.blender || "—";
@@ -455,7 +499,42 @@ function showLocation() {
 window.addEventListener("hashchange", showLocation);
 showLocation();
 
-document.querySelectorAll("[data-control]").forEach(button => {
+for (const button of nodeButtons) {
+  button.dataset.label = button.textContent;
+  button.addEventListener("click", async () => {
+    const action = button.dataset.control;
+    nodeRequest = action;
+    ++nodeGeneration;
+    showNodeFeedback(`正在${button.dataset.label}…`, "pending");
+    showNodeControls();
+    try {
+      const state = await api(action, {});
+      if (action === "stop") {
+        pendingStop = true;
+        showNodeFeedback("停止请求已收到，正在等待节点退出。", "pending");
+      } else {
+        const active = state.active.length;
+        const result = {
+          start: state.draining ? "节点已启动，领单仍处于暂停状态。" : "节点已启动。",
+          drain: active ? `已暂停领单，${active} 条在途工单继续执行。` : "已暂停领单。",
+          resume: "已恢复领单。",
+        };
+        showNodeFeedback(result[action], "success");
+      }
+      updateNodeState(state);
+    } catch (error) {
+      showNodeFeedback(`${button.dataset.label}失败。 ${error.message}`, "error");
+    } finally {
+      nodeRequest = "";
+      ++nodeGeneration;
+      showNodeControls();
+    }
+    await refresh();
+  });
+}
+showNodeControls();
+
+document.querySelectorAll("[data-control]:not(.node-actions [data-control])").forEach(button => {
   button.addEventListener("click", async () => {
     button.disabled = true;
     try {

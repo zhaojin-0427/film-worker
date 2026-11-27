@@ -14,7 +14,7 @@ import uuid
 from fractions import Fraction
 from pathlib import Path
 
-from . import blender_author, bundles, draft_review, media, model, model_recovery, quality, shot_draft, visual_review
+from . import blender_author, bundles, draft_review, media, model, model_recovery, quality, render_resume, shot_draft, visual_review
 from .actor_guard import ACTOR_GEOMETRY
 from .engineering_checks import EngineeringValidationError
 from .progress import Progress
@@ -86,6 +86,7 @@ class Production:
         self.review_clarity = settings.get("review_clarity")
         self.dual_role = settings.get("dual_role_review", False)
         self.recovery_at_start = self.model_checkpoint()
+        self.previous_attempts = render_resume.previous_attempts(directory, request)
 
     def blender_command(self, *arguments):
         return [sys.executable, str(HERE / "blender_author.py"), self.tools["blender"], *arguments]
@@ -258,6 +259,14 @@ class Production:
         return result
 
     def create_review(self, source):
+        if self.previous_attempts and not any(self.stage.iterdir()) and not (self.root / "prepared.json").exists():
+            backend = self.env["render_backend"]
+            if render_resume.restore_review(
+                    self.previous_attempts, self.root, self.render_tag(None, self.review_size, backend),
+                    self.request["assignment"]["input_manifest_sha256"],
+                    auxiliary=(ACTOR_GEOMETRY, "shot-plan.json", "scene_details.py", "制作记录.md"),
+                    compatibility=self.env["compatibility"]):
+                print("已复用上一轮核验通过的 Blender 工程和镜头记录", flush=True)
         if self.previous:
             annotator, approved = self.approval()
             feedback = media.read_json(self.sources["feedback_manifest"])
@@ -295,8 +304,14 @@ class Production:
             if self.previous and not recovery:
                 shutil.copyfile(self.scene_file, scene)
                 shutil.copyfile(self.sources["shot_metadata"], meta)
-                if (self.prior_scene / ACTOR_GEOMETRY).is_file():
-                    shutil.copyfile(self.prior_scene / ACTOR_GEOMETRY, self.stage / ACTOR_GEOMETRY)
+                if (baseline := self.prior_scene / ACTOR_GEOMETRY).is_file():
+                    snapshot = self.stage / ACTOR_GEOMETRY
+                    shutil.copyfile(baseline, snapshot)
+                    if media.read_json(snapshot).get("schema_version") != 2:
+                        with slot(Path(self.request["resources"]), "blender", self.request["render_slots"]):
+                            self.run_tool("capture-base-actors", self.blender_command(
+                                "-b", "--disable-autoexec", str(self.scene_file), "--python-exit-code", "1",
+                                "-P", str(HERE / "actor_guard.py"), "--", str(snapshot)), engineering=True)
             attempted = self.stage / ".engineering-repair-attempted"
             repairing = attempted.is_file() and recovery.get("phase") in {"codex-repair", "codex-self-review"}
             try:
@@ -606,6 +621,12 @@ class Production:
         return receipt.read_text(encoding="utf-8")
 
     def repair_visual(self, source, scene, meta, revision, context_hash):
+        if self.kind == "prepare" and not (self.stage / "draft-context.json").is_file():
+            plan = self.stage / "shot-plan.json"
+            authored_plan = plan.read_bytes() if plan.is_file() else None
+            shot_draft.prepare(self.stage, source, self.root / "intake", self.timeline, BODY_MODEL)
+            if authored_plan is not None:
+                plan.write_bytes(authored_plan)
         self.progress("codex_visual_repair")
         prompt = self.author_prompt(source) + (
             "\n独立审核结论如下。修正对应帧段，保留其余已对齐内容，保存更新后的工程和制作记录。"
@@ -615,14 +636,14 @@ class Production:
         saved = model_recovery.checkpoint(self.root)
         session = next((saved.get("sessions", {}).get(name) for name in ("codex-visual-repair", "codex-repair", "codex-resume", "codex")
                         if saved.get("sessions", {}).get(name)), None)
-        if not (saved.get("phase") == "codex-visual-repair" and saved.get("context_hash") == context_hash
-                and saved.get("state") == "completed"):
-            with slot(Path(self.request["resources"]), "codex", self.request["model_slots"]):
-                self.run_model(prompt, "codex-visual-repair", resume=session, context_hash=context_hash)
-        if self.kind == "prepare" and not shot_draft.current(self.stage):
-            compile_cmd, _ = self.draft_commands(source)
-            with slot(Path(self.request["resources"]), "blender", self.request["render_slots"]):
-                self.run_tool("compile-draft", compile_cmd, engineering=True)
+        repair_receipt = self.root / "visual-repair-author.json"
+        with slot(Path(self.request["resources"]), "codex", self.request["model_slots"]):
+            if model_recovery.read_state(repair_receipt).get("context") != context_hash:
+                if not (saved.get("phase") == "codex-visual-repair" and saved.get("context_hash") == context_hash
+                        and saved.get("state") == "completed"):
+                    self.run_model(prompt, "codex-visual-repair", resume=session, context_hash=context_hash)
+                atomic_json(repair_receipt, {"context": context_hash})
+            self.complete_draft(source, self.author_prompt(source))
         self.validate_scene(scene, meta)
 
     def draft_commands(self, source):
@@ -631,6 +652,8 @@ class Production:
                       self.tools["blender"], str(self.request["cpu_threads"]),
                       "--backend", self.env["render_backend"],
                       "--ffmpeg", self.tools["ffmpeg"], "--ffprobe", self.tools["ffprobe"]]
+        if self.kind == "revise":
+            review_cmd += ["--timeline", str(self.root / "intake/timeline.json")]
         return compile_cmd, review_cmd
 
     def author_prompt(self, source, repair=None):
@@ -639,23 +662,18 @@ class Production:
                 return "& " + " ".join("'" + arg.replace("'", "''") + "'" for arg in arguments)
             return shlex.join(arguments)
 
-        compile_cmd, review_cmd = self.draft_commands(source)
+        compile_cmd, _ = self.draft_commands(source)
         skill = (SKILL / "SKILL.md").read_text(encoding="utf-8")
         sop = (SKILL / "references/制作SOP.md").read_text(encoding="utf-8")
-        review_step = ("保存工程和制作记录后结束首制，由执行端生成全片自检对比片，再开始复查。"
-                       if os.name == "nt" else f"""随后按原时间线编码全部帧的首版自检对比：
-{quote(review_cmd)}
-查看整条自检片。无法播放时从编码后的视频解出连续画面，逐镜复查，发现偏差就修正、重编、重新编码再检查。""")
-        if self.dual_role:
-            review_step = "保存工程、镜头表和制作记录后结束。执行端将试渲并交给独立审核员。"
-        phase = f"""这是 Codex 内部试制首制。先核对完整原片、编号帧和 镜头参考，使用连续帧修正候选切点。
+        phase = f"""这是 Codex 内部试制首制。先从头到尾观看原片，理解内容与动作逻辑，再看编号帧和镜头参考，使用连续帧修正候选切点。
+工具无法播放原片时，按源帧顺序连续查看各镜头和动作段，覆盖整条时间线。
 完成 shot-plan.json 后用下列命令编译出完整 scene.blend 与 meta.jsonl：
 {quote(compile_cmd)}
-可追加 --preview 与帧号快速试渲。{review_step}
+可追加 --preview 与帧号快速试渲。
 镜头表规范如下。
 {(SKILL / 'references/镜头表.md').read_text(encoding='utf-8')}
 """ if self.kind == "prepare" else """这是 Codex 内部试制返修。当前目录已有基版场景、镜头信息、返修单和圈选预览。
-先读 feedback-summary.json，再按需要检查 feedback.json 原文、圈选图及连续源帧。按帧号核对受影响的动作范围和相邻帧，修改 scene.blend 及需要更新的 meta.jsonl。
+先从头到尾看原片和动作逻辑，再读 feedback-summary.json、反馈原文、圈选图及相关连续源帧。按帧号核对受影响的动作范围和相邻帧，修改 scene.blend 及需要更新的 meta.jsonl。
 圈选坐标相对于整张上下对比图，上方原片、下方白模。补建网格使用包内 production_palette.apply_palette 并保留原来的人体几何及其配色属性。
 """
         if self.rejected_frames is not None:
@@ -668,16 +686,12 @@ class Production:
                              "-vf", frame_filter, "-frames:v", "1", "-update", "1", "-y",
                              str(self.stage / "检查帧-0001.png")])
             probe = quote([self.tools["ffprobe"], "-v", "error", "-show_streams", "-of", "json", str(source)])
-            handoff = ("保存当前工程输入和制作记录，由执行端生成送审对比。" if self.dual_role else
-                       "首制或自检修正后保存当前工程输入和制作记录，由执行端生成全片自检对比片，再逐镜复查。"
-                       if self.kind == "prepare" else "返修后保存工程和制作记录，由执行端重渲并生成送审对比。")
             media_tools = f"""## Windows 看图与自检
 首制、返修和自检均直接看编号 PNG、镜头参考和已有的反馈图。用包内 FFmpeg 对原片、自检片及试渲结果抽帧、缩放或拼图，使用 FFprobe 读媒体信息。
 下列 PowerShell 命令按显示顺序抽原片第 1 帧。检查第 F 帧时把 n 的比较值改为 F-1，修改输出文件名。检查对比片时把输入改为现有的首版自检对比.mp4。
 {extract}
 {probe}
-执行端使用 PyAV 和 Pillow 解码、生成参考图、编码自检片并核验时序。模型进程及其临时脚本禁止导入 av、PIL 或 Pillow。
-{handoff}"""
+执行端使用 PyAV 和 Pillow 解码、生成参考图、编码自检片并核验时序。模型进程及其临时脚本禁止导入 av、PIL 或 Pillow。"""
         else:
             media_tools = f"如需从自检 MP4 读取编号帧，FFmpeg 路径为 {quote([self.tools['ffmpeg']])}。"
         script_types = """## 建模脚本的数值和 JSON
@@ -691,12 +705,14 @@ Blender 启动只能用后台前缀 {quote(self.blender_command())}，追加 -b 
 检查投影与预览也沿用此命令。Windows PowerShell 请直接使用上述带调用符 & 的命令。
 所有制作和试渲统一用 Cycles。禁止在补建脚本或工程中切换到 Eevee、Workbench。
 提交本轮 制作记录.md，写明切点、可见动作、核对过的帧段和需要人工判断的地方。
+本阶段保存工程输入和制作记录。随后执行端会编码全片对比，自检阶段由制作员完整复看，发现偏差则修正并复查新版本。
 禁止用源帧贴图、加入外部素材、重塑甲方人体或访问历史工单和用户目录。
 
 {phase}
 {technical}
 {skill}
 {sop}
+{quality.L3_RULES}
 {media_tools}
 {script_types}
 
@@ -713,8 +729,7 @@ Blender 启动只能用后台前缀 {quote(self.blender_command())}，追加 -b 
         prompt.write_text(text, encoding="utf-8")
         resume_prompt = self.root / (name + "-resume-prompt.txt")
         resume_prompt.write_text(
-            "接续刚才中断的本工单和当前制作阶段。以本轮目录中已保存的工程、镜头表、编号 PNG、自检片和制作记录为依据，"
-            "检查上一步结果，继续未完成的工作。用包内 FFmpeg 看图，保存实际制作或自检记录后结束本轮。\n",
+            "接续刚才中断的本工单和当前制作阶段。检查上一步结果，继续未完成的工作。\n" + text,
             encoding="utf-8",
         )
         overrides = dict(self.profile)
@@ -753,7 +768,7 @@ Blender 启动只能用后台前缀 {quote(self.blender_command())}，追加 -b 
         prompt = self.author_prompt(source, repair)
         saved, self.recovery_at_start = self.recovery_at_start, {}
         phase = saved.get("phase")
-        if self.kind == "prepare" and phase == "codex-self-review":
+        if phase == "codex-self-review":
             if saved.get("state") == "completed":
                 actual = saved.get("evidence", {})
                 self.env.update(actual, model_evidence="observed" if actual and all(actual.values()) else "unknown")
@@ -781,12 +796,7 @@ Blender 启动只能用后台前缀 {quote(self.blender_command())}，追加 -b 
         else:
             self.progress({"codex": "codex_author", "codex-repair": "codex_repair", "codex-resume": "codex_resume"}[name])
             self.run_model(prompt, name)
-        if self.kind == "prepare" and self.dual_role and not shot_draft.current(self.stage):
-            compile_cmd, _ = self.draft_commands(source)
-            with slot(Path(self.request["resources"]), "blender", self.request["render_slots"]):
-                self.run_tool("compile-draft", compile_cmd, engineering=True)
-        elif self.kind == "prepare" and not self.dual_role:
-            self.complete_draft(source, prompt)
+        self.complete_draft(source, prompt)
 
     def resume_request(self):
         work = self.root.parent
@@ -798,50 +808,62 @@ Blender 启动只能用后台前缀 {quote(self.blender_command())}，追加 -b 
         return path if path.is_file() else None
 
     def complete_draft(self, source, prompt):
-        if not (self.stage / "shot-plan.json").is_file():
+        if self.kind == "prepare" and not (self.stage / "shot-plan.json").is_file():
             raise EngineeringValidationError("首版缺少 shot-plan.json")
         compile_cmd, review_cmd = self.draft_commands(source)
         resources = Path(self.request["resources"])
         record = self.stage / "制作记录.md"
+        receipt = self.stage / ".author-review.json"
+        meta = self.stage / "meta.jsonl"
 
         def current():
-            return shot_draft.current(self.stage) and draft_review.current(self.stage)
+            return (self.kind != "prepare" or shot_draft.current(self.stage)) and draft_review.current(self.stage)
 
         def recorded():
             return record.is_file() and bool(record.read_text(encoding="utf-8").strip())
 
-        review_attempts = 2 if os.name == "nt" else 1
-        review_instruction = ("现在进入首版自检。逐镜对照原片与复刻，查看切点和动作转折前后的连续帧。"
-                              "核对头与胸口的朝向、四肢接触、主体位置、裁切和遮挡。发现能定位的偏差就修改工程输入，"
-                              "保存更新后的镜头表、补建脚本及制作记录，由执行端重渲后再次检查。"
-                              "记录实际看过的帧段、改动和仍需人工判断的偏差。"
-                              if os.name == "nt" else "复查当前首版自检对比片，修正后重新编码并更新制作记录。")
-        saved = self.model_checkpoint()
-        if saved.get("phase") == "codex-self-review" and saved.get("state") != "completed":
-            self.progress("codex_self_review")
-            self.run_model(f"{prompt}\n{review_instruction}", "codex-self-review")
-            review_attempts -= 1
-        if current() and recorded():
-            return
-        for _ in range(review_attempts):
+        review_instruction = (
+            f"现在完整复看编码后的《{draft_review.MOVIE}》，从第一镜到最后一镜逐镜与原片核对。"
+            "无法播放时，用 FFmpeg 从编码后的对比片解出连续画面并覆盖整条时间线。"
+            "先核对 L3 外观和固定配色，再核对朝向、接触、主体位置、裁切、遮挡和动作节奏。"
+            "发现偏差就修正工程或镜头表，执行端会重渲、重新编码并再次安排复查。"
+            "制作记录必须注明实际看过的帧段、改动和需要人工判断的偏差。"
+        )
+        for round_number in range(3):
             self.progress("waiting_for_draft_blender")
             with slot(resources, "blender", self.request["render_slots"]):
-                if not shot_draft.current(self.stage):
+                if self.kind == "prepare" and not shot_draft.current(self.stage):
                     self.progress("draft_compile")
                     self.run_tool("compile-draft", compile_cmd, engineering=True)
                 if not draft_review.current(self.stage):
                     self.progress("draft_review")
                     self.run_tool("draft-review", [*review_cmd, "--report-progress"], engineering=True)
-            self.progress("codex_self_review")
-            self.run_model(f"{prompt}\n{review_instruction}", "codex-self-review")
-            if current() and recorded():
+            stamp = media.read_json(self.stage / draft_review.STAMP)
+            if not meta.is_file():
+                raise EngineeringValidationError("缺少自检工程的镜头信息 meta.jsonl")
+            instruction = review_instruction
+            if round_number == 2:
+                instruction += "本轮只复核当前编码版本并更新制作记录，保留工程和镜头表，将剩余偏差交给后续审核。"
+            evidence = dict(stamp, meta=digest(meta), rules=object_hash([quality.L3_RULES, review_instruction]))
+            if recorded() and model_recovery.read_state(receipt) == dict(evidence, record=digest(record)):
                 return
-        raise EngineeringValidationError("首版缺少本工程对应的自检对比片或制作记录")
+            self.progress("codex_self_review")
+            self.run_model(f"{instruction}\n\n以下是本工单制作资料和规则。在本阶段只执行上述自检要求。\n{prompt}",
+                           "codex-self-review", context_hash=object_hash([evidence, instruction]))
+            if (current() and recorded() and meta.is_file() and digest(meta) == evidence["meta"]
+                    and media.read_json(self.stage / draft_review.STAMP) == stamp):
+                atomic_json(receipt, dict(evidence, record=digest(record)))
+                return
+        raise EngineeringValidationError("当前工程缺少对应的完整对比片自检或制作记录")
 
     def render(self, scene, target, purpose, *, on_frames=None):
         self.progress("waiting_for_blender")
         with slot(Path(self.request["resources"]), "blender", self.request["render_slots"]):
             return self.render_locked(scene, target, purpose, on_frames=on_frames)
+
+    def render_tag(self, scene_sha, target, backend):
+        return dict(scene_sha256=scene_sha, dimensions=list(target), renderer=self.tools["blender"],
+                    blender=self.env.get("compatibility", {}).get("blender"), count=self.count, backend=backend)
 
     def render_locked(self, scene, target, purpose, *, on_frames=None):
         backend = self.env["render_backend"]
@@ -850,21 +872,28 @@ Blender 启动只能用后台前缀 {quote(self.blender_command())}，追加 -b 
         for option in options:
             frames = self.root / f"{purpose}-{option}"
             recorded = frames / "checkpoint.json"
-            tag = dict(scene_sha256=scene_sha, dimensions=list(target),
-                       renderer=self.tools["blender"], blender=self.env.get("compatibility", {}).get("blender"),
-                       count=self.count, backend=option)
+            tag = self.render_tag(scene_sha, target, option)
             if frames.exists() and (not recorded.exists() or media.read_json(recorded) != tag):
                 shutil.rmtree(frames)
             atomic_json(recorded, tag)
             check_rendered_frames(frames, target, self.count, complete=False)
+            reused = render_resume.reuse_frames(self.previous_attempts, frames, tag)
+            if reused:
+                print(f"跨尝试复用 {reused}/{self.count} 张已校验的 {purpose} PNG", flush=True)
             args = self.blender_command("-b", "--disable-autoexec", str(scene), "--python-exit-code", "1", "-P",
                     str(HERE / "render_frames.py"), "--", str(frames), option, *map(str,target),
                     str(self.request["cpu_threads"]))
-            self.progress(f"render_{purpose}_{option}", 0, self.count, render_size=target)
+            stage = f"render_{purpose}_{option}"
+            completed = sum(media.frame_path(frames, n).is_file() for n in range(1, self.count + 1))
+            self.progress(stage, completed, self.count, render_size=target)
             try:
-                self.run_tool(f"blender-{purpose}-{option}", args, frames=frames, stage=f"render_{purpose}_{option}",
-                              on_frames=(lambda: on_frames(frames)) if on_frames else None)
+                if completed < self.count:
+                    self.run_tool(f"blender-{purpose}-{option}", args, frames=frames, stage=stage,
+                                  on_frames=(lambda: on_frames(frames)) if on_frames else None)
+                elif on_frames:
+                    on_frames(frames)
                 check_rendered_frames(frames, target, self.count, complete=True)
+                self.progress(stage, self.count, self.count)
                 self.env["render_backend"] = option
                 return frames
             except (visual_review.VisualReviewError, model_recovery.RecoveryTimeout):

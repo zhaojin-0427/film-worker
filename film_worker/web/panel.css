@@ -69,6 +69,12 @@ main { min-width: 0; max-width: 1480px; margin-left: 222px; padding: 36px clamp(
 }
 .page-header { margin-bottom: 24px; }
 #capacity { margin-top: 6px; font-size: 13px; }
+.node-controls { display: grid; gap: 8px; }
+#node-feedback { justify-self: start; padding: 5px 10px; border-radius: 7px; font-size: 13px; font-weight: 620; }
+#node-feedback:empty { padding: 0; }
+#node-feedback[data-state=pending] { color: var(--accent); background: #e9f1ff; }
+#node-feedback[data-state=success] { color: var(--green); background: #eaf6f0; }
+#node-feedback[data-state=error] { color: var(--danger); background: #fff0ef; }
 .actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
 button, input, select { font: inherit; color: inherit; }
 button {
@@ -84,6 +90,7 @@ button {
 }
 button:hover:not(:disabled) { background: #eef4ff; border-color: #8ca8d4; }
 button:disabled { opacity: .48; cursor: default; }
+button[aria-busy=true] { opacity: .8; cursor: progress; }
 button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
 button.primary:hover:not(:disabled) { background: #194ca7; border-color: #194ca7; }
 

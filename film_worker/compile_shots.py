@@ -296,6 +296,9 @@ def build_shot(shot, definitions, scene, library):
         parent = spec.get("parent")
         if parent:
             owner, sep, joint = parent.partition(":")
+            if definitions[owner].get("palette_role") in ACTOR_ROLES and (
+                    name in joints or joint not in {"forearm.L", "forearm.R"}):
+                raise EngineeringValidationError(f"{name} 不能挂在人偶外观上；仅手持道具可挂至前臂")
             target = joints[owner][joint] if sep else roots[owner]
             if target == ob or target in ob.children_recursive:
                 raise ValueError(f"循环挂接 {name}")
