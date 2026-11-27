@@ -1,9 +1,14 @@
 const form = document.querySelector("#form");
 const notice = document.querySelector("#notice");
 let csrf = "";
-const nodeButtons = document.querySelectorAll(".node-actions [data-control]");
+const nodeButtons = document.querySelectorAll("[data-node-control]");
 const nodeFeedback = document.querySelector("#node-feedback");
-const nodeBusyLabels = {start: "启动中…", stop: "停止中…", drain: "暂停中…", resume: "恢复中…"};
+const nodeLabels = {
+  start: {label: "启动节点", busy: "启动中…"},
+  stop: {label: "停止节点", busy: "停止中…"},
+  drain: {label: "暂停领单", busy: "暂停中…"},
+  resume: {label: "恢复领单", busy: "恢复中…"},
+};
 let nodeState = null;
 let nodeRequest = "";
 let nodeGeneration = 0;
@@ -18,6 +23,8 @@ function showNodeControls() {
   const stopped = !nodeState?.slots;
   const draining = nodeState?.draining;
   const stopping = !stopped && (pendingStop || nodeState.stopping);
+  const powerAction = stopped ? "start" : "stop";
+  const claimsAction = draining ? "resume" : "drain";
   const capacity = document.querySelector("#capacity");
   if (nodeState) {
     capacity.textContent = stopping ? "节点正在停止" : stopped ? "节点已停止"
@@ -26,14 +33,16 @@ function showNodeControls() {
     capacity.title = nodeState.detail ?? "";
   }
   for (const button of nodeButtons) {
-    const action = button.dataset.control;
-    const busy = action === nodeRequest || (action === "stop" && stopping);
-    button.textContent = busy ? nodeBusyLabels[action] : button.dataset.label;
+    const power = button.dataset.nodeControl === "power";
+    const request = power ? ["start", "stop"].includes(nodeRequest) : ["drain", "resume"].includes(nodeRequest);
+    const action = request ? nodeRequest : (power ? powerAction : claimsAction);
+    const busy = request || (power && stopping);
+    button.dataset.action = action;
+    button.textContent = nodeLabels[action][busy ? "busy" : "label"];
+    button.classList.toggle("primary", action === "start" || action === "resume");
     if (busy) button.setAttribute("aria-busy", "true");
     else button.removeAttribute("aria-busy");
-    button.disabled = !csrf || !nodeState || Boolean(nodeRequest) || stopping
-      || (action === "start" ? !stopped : stopped)
-      || (action === "drain" && draining) || (action === "resume" && !draining);
+    button.disabled = !csrf || !nodeState || Boolean(nodeRequest) || stopping || (!power && stopped);
   }
 }
 
@@ -500,12 +509,12 @@ window.addEventListener("hashchange", showLocation);
 showLocation();
 
 for (const button of nodeButtons) {
-  button.dataset.label = button.textContent;
   button.addEventListener("click", async () => {
-    const action = button.dataset.control;
+    const action = button.dataset.action;
+    const {label} = nodeLabels[action];
     nodeRequest = action;
     ++nodeGeneration;
-    showNodeFeedback(`正在${button.dataset.label}…`, "pending");
+    showNodeFeedback(`正在${label}…`, "pending");
     showNodeControls();
     try {
       const state = await api(action, {});
@@ -523,7 +532,7 @@ for (const button of nodeButtons) {
       }
       updateNodeState(state);
     } catch (error) {
-      showNodeFeedback(`${button.dataset.label}失败。 ${error.message}`, "error");
+      showNodeFeedback(`${label}失败。 ${error.message}`, "error");
     } finally {
       nodeRequest = "";
       ++nodeGeneration;
@@ -534,7 +543,7 @@ for (const button of nodeButtons) {
 }
 showNodeControls();
 
-document.querySelectorAll("[data-control]:not(.node-actions [data-control])").forEach(button => {
+document.querySelectorAll("[data-control]").forEach(button => {
   button.addEventListener("click", async () => {
     button.disabled = true;
     try {
