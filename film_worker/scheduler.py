@@ -725,8 +725,10 @@ class Scheduler:
                 if len(samples) != len(wanted):
                     raise ValueError("成片对比图抽帧不完整")
             atomic_json(review, dict(schema_version=1, **expected, samples=samples, status="pending"))
-        report("awaiting_local_review")
+        displayed = False
         while not transfer.stop.is_set():
+            if not displayed:
+                displayed = report("awaiting_local_review")
             try:
                 decision = read(approval) if approval.is_file() else {}
             except (OSError, ValueError, TypeError):

@@ -11,6 +11,7 @@ from threading import Event
 from PIL import Image, ImageDraw, ImageOps
 
 from . import model_recovery, quality
+from .progress import write_progress
 from .protocol import digest
 from .settings import object_hash
 
@@ -95,8 +96,8 @@ class VisualReview:
         self.executor = None
 
     def report(self):
-        model_recovery.write_state(self.worker.root / "visual-progress.json",
-                                   dict(preview=self.preview, ready=len(self.ready), total=len(self.required)))
+        write_progress(self.worker.root / "visual-progress.json",
+                       dict(preview=self.preview, ready=len(self.ready), total=len(self.required)))
 
     def add(self, number, pair_file):
         checksum = digest(pair_file)

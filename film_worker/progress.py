@@ -1,27 +1,42 @@
 """Local panel timings and observable production milestones."""
 import json
+import logging
 import re
 import time
 from contextlib import suppress
 from datetime import datetime, timezone
 
 from .model_recovery import BACKOFF, checkpoint, clock_text, location, read_state
-from .settings import atomic_json
+from .settings import atomic_json, windows_file_contention
+
+
+def write_progress(path, value):
+    try:
+        atomic_json(path, value)
+    except PermissionError as exc:
+        if not windows_file_contention(exc):
+            raise
+        logging.getLogger(__name__).warning("进度暂未更新 %s (WinError %s)", path.name, exc.winerror)
+        return False
+    return True
 
 
 class Progress:
     def __init__(self, directory):
         self.directory = directory
         self.stage = None
+        self.panel_pending = None
 
     def __call__(self, stage, completed=0, total=None, *, render_size=None):
         if stage != self.stage:
-            with suppress(OSError):
-                atomic_json(self.directory / "panel-progress.json", dict(
-                    stage=stage, started_at=datetime.now(timezone.utc).isoformat(), render_size=render_size,
-                ))
             self.stage = stage
-        atomic_json(self.directory / "progress.json", dict(stage=stage, completed=completed, total=total))
+            self.panel_pending = dict(stage=stage, started_at=datetime.now(timezone.utc).isoformat(),
+                                      render_size=render_size)
+        if self.panel_pending:
+            with suppress(OSError):
+                if write_progress(self.directory / "panel-progress.json", self.panel_pending):
+                    self.panel_pending = None
+        return write_progress(self.directory / "progress.json", dict(stage=stage, completed=completed, total=total))
 
 
 CODEX_LOGS = {

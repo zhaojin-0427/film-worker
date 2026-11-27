@@ -3,11 +3,57 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from film_worker.progress import Progress, panel_details
+from film_worker.settings import atomic_json
 
 
 class PanelProgressTests(unittest.TestCase):
+    def test_progress_replace_retries_windows_sharing_violation(self):
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp)
+            progress = Progress(directory)
+            denied = PermissionError("sharing violation")
+            denied.winerror = 32
+            replace = Path.replace
+            attempts = []
+
+            def replace_once_blocked(source, target):
+                if target.name == "progress.json":
+                    attempts.append(source)
+                    if len(attempts) == 1:
+                        raise denied
+                return replace(source, target)
+
+            with patch.object(Path, "replace", replace_once_blocked):
+                self.assertTrue(progress("render_review_optix", 1, 130))
+            self.assertEqual(len(attempts), 2)
+            self.assertEqual(attempts[0], attempts[1])
+            self.assertEqual(json.loads((directory / "progress.json").read_bytes())["completed"], 1)
+            self.assertFalse(list(directory.glob("*.tmp")))
+
+    def test_progress_keeps_last_snapshot_if_windows_still_denies_replace(self):
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp)
+            path = directory / "progress.json"
+            progress = Progress(directory)
+            progress("render_review_optix", 1, 130)
+            denied = PermissionError("access denied")
+            denied.winerror = 5
+            with (patch.object(Path, "replace", side_effect=denied),
+                  patch("film_worker.settings.time.sleep") as wait,
+                  self.assertLogs("film_worker.progress", level="WARNING") as warning):
+                self.assertFalse(progress("render_review_optix", 2, 130))
+                self.assertEqual(wait.call_count, 3)
+                with self.assertRaises(PermissionError):
+                    atomic_json(directory / "outputs.json", {"required": True})
+            self.assertIn("WinError 5", warning.output[0])
+            self.assertEqual(json.loads(path.read_bytes())["completed"], 1)
+            self.assertTrue(progress("render_review_optix", 3, 130))
+            self.assertEqual(json.loads(path.read_bytes())["completed"], 3)
+            self.assertFalse(list(directory.glob("*.tmp")))
+
     def test_render_stage_keeps_its_start_and_reports_dimensions(self):
         with tempfile.TemporaryDirectory() as temp:
             directory = Path(temp)

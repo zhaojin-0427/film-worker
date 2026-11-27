@@ -6,7 +6,10 @@ import platform
 import re
 import shutil
 import subprocess
+import time
+from contextlib import suppress
 from pathlib import Path
+from uuid import uuid4
 
 import av
 import PIL
@@ -60,14 +63,30 @@ def data_root():
     return home / "Library/Application Support/Film Worker"
 
 
+def windows_file_contention(error):
+    return isinstance(error, PermissionError) and getattr(error, "winerror", None) in {5, 32, 33}
+
+
 def atomic_json(path, value):
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    with tmp.open("w", encoding="utf-8") as out:
-        json.dump(value, out, ensure_ascii=False, indent=2, allow_nan=False)
-        out.flush()
-        os.fsync(out.fileno())
-    tmp.replace(path)
+    tmp = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    try:
+        # Create the file beside its target with the directory's inherited ACL.
+        with tmp.open("x", encoding="utf-8") as out:
+            json.dump(value, out, ensure_ascii=False, indent=2, allow_nan=False)
+            out.flush()
+            os.fsync(out.fileno())
+        for delay in (0.05, 0.1, 0.15, None):
+            try:
+                tmp.replace(path)
+                return
+            except PermissionError as exc:
+                if delay is None or not windows_file_contention(exc):
+                    raise
+                time.sleep(delay)
+    finally:
+        with suppress(OSError):
+            tmp.unlink(missing_ok=True)
 
 
 def object_hash(value):

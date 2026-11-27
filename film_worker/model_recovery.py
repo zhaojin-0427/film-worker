@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 
 from .model import evidence
 from .processes import ProcessTree
-from .settings import atomic_json
+from .settings import atomic_json as write_state
 
 STALL_SECONDS = 180
 BACKOFF = (30, 120)
@@ -50,17 +50,6 @@ def read_state(path):
         return data if isinstance(data, dict) else {}
     except (OSError, ValueError):
         return {}
-
-
-def write_state(path, data):
-    for attempt in range(4):
-        try:
-            atomic_json(path, data)
-            return
-        except PermissionError as exc:
-            if getattr(exc, "winerror", None) not in {5, 32} or attempt == 3:
-                raise
-            time.sleep(.05 * (attempt + 1))
 
 
 class ResumeLease:
