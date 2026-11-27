@@ -23,7 +23,7 @@ from .protocol import (LOCAL_REVIEW_MODE, REJECTED_FRAMES_MODE, REVIEW_STORAGE_H
 from .secrets import read_oss_keys
 from .settings import (KINDS, REVIEW_FIELDS, ROOT, atomic_json, environment, inspect_tools, object_hash,
                        production_settings, registration, resolve_tools, validate_config)
-from .state import State, identity, slot
+from .state import State, StateBusy, identity, slot
 
 
 ROLE_TYPES = {
@@ -152,20 +152,19 @@ class Events:
 
     def send(self, status, *, level="info", message=None):
         with self.lock:
-            self.state.event(self.assignment, status, level=level, message=message)
-            batch = self.state.queued_events(self.assignment)
-            if not batch or self.transfer.stop.is_set():
-                return
-            token = key(self.transfer.work, self.transfer.headers["X-Lease-Id"], batch)
             try:
+                self.state.event(self.assignment, status, level=level, message=message)
+                batch = self.state.queued_events(self.assignment)
+                if not batch or self.transfer.stop.is_set():
+                    return
+                token = key(self.transfer.work, self.transfer.headers["X-Lease-Id"], batch)
                 result, _ = self.transfer.api.json("POST", f"/work/{self.transfer.work}/events", body={"events":batch},
                                                   headers={**self.transfer.headers, "Idempotency-Key":token}, timeout=4)
                 acknowledged = result["accepted_through"]
                 if batch[0]["sequence"] <= acknowledged <= batch[-1]["sequence"]:
                     self.state.accept_events(self.assignment, acknowledged)
-            except (ProtocolError, KeyError, ValueError, TypeError):
-                # SQLite retains the events for the next pulse. Availability of progress logs
-                # never determines whether a valid result can be committed.
+            except (ProtocolError, KeyError, ValueError, TypeError, StateBusy):
+                # Retry any persisted events on the next pulse. Progress reporting is optional.
                 pass
 
 
@@ -188,6 +187,7 @@ class Scheduler:
         self.lock = threading.Lock()
         self.staleness = {}
         self.delivery_checks = {}
+        self.recover_requested = threading.Event()
         self.status = dict(connection="connecting", last_success=None)
         self.session = {}
         scope = key(config["server"], config["node_key"])
@@ -261,7 +261,8 @@ class Scheduler:
                         accept = answer["accept_claims"]
                         heartbeat_at = now + self.session["heartbeat_seconds"]
                         self.note("connected", True)
-                    if now >= next_reconcile:
+                    if now >= next_reconcile or self.recover_requested.is_set():
+                        self.recover_requested.clear()
                         self.recover()
                         self.reconcile()
                         next_reconcile = time.monotonic() + 60
@@ -277,6 +278,10 @@ class Scheduler:
                         next_poll = time.monotonic() + wait
                     retry = 1
                     self.stop.wait(0.25)
+                except StateBusy as exc:
+                    self.recover_requested.set()
+                    self.note("state_busy", detail=str(exc))
+                    self.stop.wait(1)
                 except ProtocolError as exc:
                     self.note(exc.code)
                     if exc.status in (401, 403, 404) or exc.code == "worker_unknown":
@@ -541,13 +546,19 @@ class Scheduler:
         shutil.rmtree(self.root / "local-reviews" / opaque(job), ignore_errors=True)
 
     def execute(self, assignment, deadline, heartbeat_seconds, current, pending):
+        needs_recovery = False
         try:
             self.execute_attempt(assignment, deadline, heartbeat_seconds, current, pending)
+        except StateBusy as exc:
+            self.note("state_busy", detail=str(exc))
+            needs_recovery = True
         except (ValueError, TypeError, KeyError, OSError) as exc:
             self.state.mark(assignment, message=f"执行工单初始化或收尾失败 · {type(exc).__name__}")
         finally:
             with self.lock:
                 del self.active[identity(assignment)]
+            if needs_recovery:
+                self.recover_requested.set()
 
     def execute_attempt(self, assignment, deadline, heartbeat_seconds, current, pending):
         directory = current["directory"]

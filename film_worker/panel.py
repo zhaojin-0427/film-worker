@@ -17,7 +17,7 @@ from .releases import RESTART_FOR_UPDATE, Releases
 from .scheduler import Scheduler, attempt_history
 from .secrets import read_oss_keys, read_token, store_oss_keys, store_token
 from .settings import REVIEW_FIELDS, atomic_json, inspect_tools, load, resolve_tools, validate_config
-from .state import State
+from .state import State, StateBusy
 
 
 WEB = Path(__file__).with_name("web")
@@ -71,7 +71,10 @@ class Panel(ThreadingHTTPServer):
                       rollback_available=release["previous"] is not None)
         if self.scheduler and self.runner and self.runner.is_alive():
             return {**self.scheduler.summary(), **detail}
-        history = attempt_history(self.root, State(self.root)) if (self.root / "worker.sqlite3").is_file() else []
+        state = self.scheduler.state if self.scheduler else None
+        if state is None and (self.root / "worker.sqlite3").is_file():
+            state = State(self.root)
+        history = attempt_history(self.root, state) if state else []
         return dict(connection="stopped", active=[], history=history, draining=False, detail=self.start_error, **detail)
 
     def update(self, *, rollback=False):
@@ -173,7 +176,10 @@ class Handler(BaseHTTPRequestHandler):
             except (ValueError,OSError) as exc:
                 return self.reply(400, {"error":str(exc)})
         if path == "/api/status":
-            return self.reply(200, self.server.summary())
+            try:
+                return self.reply(200, self.server.summary())
+            except StateBusy as exc:
+                return self.reply(503, {"error": str(exc)})
         if path == "/api/local-review":
             return self.reply(200, {"reviews": [data for _, data in self.local_reviews()]})
         if path == "/api/local-review/sample":
@@ -298,6 +304,8 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     return self.reply(404, {"error": "未知操作"})
             self.reply(200, node.summary())
+        except StateBusy as exc:
+            self.reply(503, {"error": str(exc)})
         except (ValueError, OSError, KeyError, TypeError) as exc:
             self.reply(400, {"error": str(exc)})
 
@@ -318,7 +326,7 @@ def serve(root, port, browser, *, test_http=False):
         if server.config.is_file():
             try:
                 server.start()
-            except (ValueError, OSError) as exc:
+            except (ValueError, OSError, StateBusy) as exc:
                 server.start_error = str(exc)
         threading.Thread(target=server.poll_updates, daemon=True).start()
         marker = startup.endpoint_file(root)

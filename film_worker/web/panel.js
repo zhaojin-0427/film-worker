@@ -19,7 +19,7 @@ async function api(path, body) {
   return data;
 }
 
-const stateNames = {connected: "服务已连接", stopped: "未运行", connecting: "正在连接", network_unavailable: "网络不可用", configuration_error: "配置需处理"};
+const stateNames = {connected: "服务已连接", stopped: "未运行", connecting: "正在连接", network_unavailable: "网络不可用", configuration_error: "配置需处理", state_busy: "本机数据库暂忙"};
 const jobKinds = {prepare: "首制", revise: "返修", finalize: "出片"};
 const jobStates = {
   queued: "排队中", running: "运行中", review: "待审核", done: "已交付",

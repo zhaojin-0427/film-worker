@@ -6,10 +6,20 @@ import uuid
 from contextlib import contextmanager
 from pathlib import Path
 from datetime import datetime, timezone
+from threading import Lock
+
+
+# Closing the last WAL connection can take an exclusive lock. Keep the panel,
+# scheduler and lease threads from opening or closing connections concurrently.
+DATABASE_LOCK = Lock()
 
 
 class InstanceBusy(BlockingIOError):
     """Another process is already holding this lock."""
+
+
+class StateBusy(Exception):
+    """SQLite could not obtain a database lock within its busy timeout."""
 
 
 @contextmanager
@@ -54,13 +64,20 @@ class State:
 
     @contextmanager
     def connection(self):
-        db = sqlite3.connect(self.path)
-        db.row_factory = sqlite3.Row
         try:
-            with db:
-                yield db
-        finally:
-            db.close()
+            with DATABASE_LOCK:
+                db = sqlite3.connect(self.path)
+                db.row_factory = sqlite3.Row
+                try:
+                    with db:
+                        yield db
+                finally:
+                    db.close()
+        except sqlite3.OperationalError as exc:
+            code = getattr(exc, "sqlite_errorcode", 0) & 0xFF
+            if code in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
+                raise StateBusy("本机数据库暂忙，正在重试") from exc
+            raise
 
     def setting(self, name):
         with self.connection() as db:

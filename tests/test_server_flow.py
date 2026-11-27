@@ -3,11 +3,12 @@ import hashlib
 import json
 import os
 import socket
+import sqlite3
 import tempfile
 import threading
 import time
 import unittest
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -16,6 +17,7 @@ from unittest.mock import patch
 from film_worker.protocol import Interrupted, LOCAL_REVIEW_MODE, REVIEW_STORAGE_HEADER
 from film_worker.scheduler import Scheduler, WorkFailure
 from film_worker.settings import DEFAULTS, atomic_json, environment, object_hash
+from film_worker.state import State, StateBusy
 
 
 ROLES = {
@@ -349,6 +351,47 @@ def fixture_outputs(node, assignment, profile, paths, directory, transfer, progr
 
 
 class WorkerFlow(unittest.TestCase):
+    def test_sqlite_contention_is_reported_as_transient(self):
+        with tempfile.TemporaryDirectory() as folder:
+            state = State(Path(folder))
+            connect = sqlite3.connect
+            with closing(connect(state.path)) as blocker, blocker:
+                blocker.execute("BEGIN IMMEDIATE")
+                with patch("film_worker.state.sqlite3.connect", side_effect=lambda path: connect(path, timeout=0)):
+                    with self.assertRaises(StateBusy):
+                        state.set("probe", True)
+            state.set("probe", True)
+            self.assertTrue(state.setting("probe"))
+
+    def test_database_busy_keeps_scheduler_and_lease_running(self):
+        poll = Scheduler.poll_deliveries
+        event = State.event
+        poll_busy = threading.Event()
+        event_busy = threading.Event()
+
+        def poll_once_busy(node):
+            if not poll_busy.is_set():
+                poll_busy.set()
+                raise StateBusy("polling while the database is locked")
+            return poll(node)
+
+        def event_once_busy(state, assignment, status, **kwargs):
+            if not event_busy.is_set():
+                event_busy.set()
+                raise StateBusy("recording progress while the database is locked")
+            return event(state, assignment, status, **kwargs)
+
+        with (tempfile.TemporaryDirectory() as folder, mock_service() as service,
+              patch.object(Scheduler, "poll_deliveries", poll_once_busy),
+              patch.object(State, "event", event_once_busy)):
+            work = service.schedule("prepare", 1)
+            with node_running(node_config(service), Path(folder), fixture_outputs) as node:
+                self.wait_for(lambda: work in service.completed, node)
+                self.wait_for(lambda: node.state.rows()[0]["status"] == "succeeded", node)
+                self.assertFalse(node.stop.is_set())
+                self.assertTrue(poll_busy.is_set())
+                self.assertTrue(event_busy.is_set())
+
     def test_local_review_rejects_wrong_instance_and_missing_frozen_version(self):
         with tempfile.TemporaryDirectory(prefix="worker-local-review-") as folder, mock_service() as service, patch(
                 "film_worker.scheduler.resolve_tools", return_value={}), patch(
